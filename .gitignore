@@ -30,3 +30,21 @@
 *.exe
 *.out
 *.app
+Stokes
+build
+
+# Resultados
+*.svg
+*.png
+solution?
+taxas.*
+
+# Makefile
+Makefile
+CMakeFiles
+cmake_install.cmake
+CMakeCache.txt
+
+# VSCode
+.vscode
+compile_commands.json
