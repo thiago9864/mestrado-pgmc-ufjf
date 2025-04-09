@@ -1,5 +1,4 @@
 
-#include <deal.II/base/convergence_table.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/logstream.h>
 #include <deal.II/base/quadrature_lib.h>
@@ -38,9 +37,9 @@ namespace CGNS {
 using namespace dealii;
 
 // Parâmetros do problema
-double visc = 0.025;
+double visc = 0.0025;
 double rho = 1.0;
-double time_end = 1.0;
+double time_end = 10.0;
 double omega_init = 0.0;
 double omega_fim = 1.0;
 
@@ -61,27 +60,23 @@ class RightHandSide : public Function<dim> {
     }
 };
 
-/*
- * Classe que contem a representação da solução exata do problema
- */
 template <int dim>
-class ExactSolution : public Function<dim> {
+class BoundaryValues : public Function<dim> {
    public:
-    ExactSolution() : Function<dim>(dim + 1) {}
+    double d = 1e-10;
+
+   public:
+    BoundaryValues() : Function<dim>(dim + 1) {}
 
     virtual void vector_value(const Point<dim> &p, Vector<double> &values) const {
         Assert(values.size() == dim + 1, ExcDimensionMismatch(values.size(), dim + 1));
+        values[0] = 0.0;    // u_x
+        values[1] = 0.0;    // u_y
+        values[dim] = 0.0;  // p
 
-        double re = 1.0 / visc;
-
-        // ux
-        values[0] = -cos(M_PI * p[0]) * sin(M_PI * p[1]) * exp((-2. * M_PI * M_PI * this->get_time()) / re);
-
-        // uy
-        values[1] = sin(M_PI * p[0]) * cos(M_PI * p[1]) * exp((-2. * M_PI * M_PI * this->get_time()) / re);
-
-        // p
-        values[dim] = -0.25 * (cos(2. * M_PI * p[0]) + cos(2. * M_PI * p[1])) * exp((-4. * M_PI * M_PI * this->get_time()) / re);
+        if (abs(p[1] - omega_fim) < d) {
+            values[0] = 1.0;  // u_x
+        }
     }
 };
 
@@ -105,7 +100,7 @@ class NavierStokesCG {
      * @i Grau de refinamento da malha -> 2^i elementos
      * @convergence_table Tabela de convergência
      */
-    void run(int i, ConvergenceTable &convergence_table) {
+    void run(int i) {
         int num_it;
         double delta;
 
@@ -117,22 +112,27 @@ class NavierStokesCG {
         timestep_number = 0;
         inicia_condicao_contorno();
         condicao_inicial();
+        // constraints.distribute(solution);
         old_solution = prev_solution;
         solution = prev_solution;
         output_results(i);
 
         // Define o tamanho do passo de tempo proporcional ao valor de h
-        double h_mesh = GridTools::maximal_cell_diameter(triangulation);
-        time_step = pow(h_mesh, degree + 1);
+        time_step = 0.1;
         time_max_number = round(time_end / time_step);
 
-        printf("Usando o delta t=%f, com h=%f\n", time_step, h_mesh);
+        printf("Usando o delta t=%f\n", time_step);
+        printf("Num de Reynolds=%f\n", 1.0 / visc);
         printf("Execução em %d passos de tempo\n", time_max_number);
 
         // Incluir aqui mais um loop pro tempo (etapa 3)
-        for (timestep_number = 1; timestep_number < time_max_number; timestep_number++) {
+        for (timestep_number = 1; condicao_de_parada(true); timestep_number++) {
             time += time_step;
             num_it = 0;
+
+            // Armazena solução em u^{n}
+            prev_solution = solution;
+
             // old_solution = 0;
             inicia_condicao_contorno();
 
@@ -148,10 +148,11 @@ class NavierStokesCG {
                 solve();
 
                 // Calcula diferença entre as soluções com a norma L2 discreta
-                delta = erro_norma_L2();
+                delta = erro_norma_L2(solution, old_solution);
 
                 // Salva cópia da solução obtida
-                old_solution.block(0) = solution.block(0);
+                // old_solution.block(0) = solution.block(0);
+                old_solution = solution;
 
                 num_it++;
                 if (num_it > 100) {
@@ -161,20 +162,14 @@ class NavierStokesCG {
                 }
             } while (delta > 1e-6);
 
-            // Armazena solução em u^{n}
-            prev_solution.block(0) = solution.block(0);
-
-            printf("Problema nao linear com %d células, resolvido no passo de tempo %d, com %d iteracoes\n",
+            printf("Problema com %d células, resolvido no passo de tempo %d (%.2f s), com %d iteracoes\n",
                    triangulation.n_active_cells(),
                    timestep_number,
+                   time,
                    num_it);
 
-            // if (timestep_number == time_max_number - 1) {
-            //     compute_errors(convergence_table);
-            // }
+            output_results(i);
         }
-        output_results(i);
-        compute_errors(convergence_table);
     }
 
    private:
@@ -193,10 +188,25 @@ class NavierStokesCG {
     double time;
     unsigned int timestep_number;
 
+    /**
+     * Condição de parada do for do tempo
+     * @is_aprox_estacionario True considera um erro entre u^n+1 e u^n menor que uma tolerancia,
+     * False usa a contagem de passos até o tempo máximo indicado na variavel 'time_end'
+     */
+    bool condicao_de_parada(bool is_aprox_estacionario) {
+        if (is_aprox_estacionario) {
+            double delta = erro_norma_L2(solution, prev_solution);
+            //printf("Timestep: %d, Delta: %f\n", timestep_number, delta);
+            return timestep_number <= 2 || delta > 10e-6;
+        } else {
+            return timestep_number <= time_max_number;
+        }
+    }
+
     /*
      * Calcula erro na norma L2 entre duas soluções
      */
-    double erro_norma_L2() {
+    double erro_norma_L2(BlockVector<double> solution_a, BlockVector<double> solution_b) {
         double erroL2 = 0.0;
         double diff;
 
@@ -207,21 +217,21 @@ class NavierStokesCG {
         const unsigned int n_q_points = quadrature_formula.size();
 
         // posições na celula atual
-        std::vector<Tensor<1, dim>> old_solution_values(n_q_points);
-        std::vector<Tensor<1, dim>> solution_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_a_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_b_values(n_q_points);
 
         const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
 
         for (const auto &cell : dof_handler.active_cell_iterators()) {
             fe_values.reinit(cell);
 
-            fe_values[velocities].get_function_values(solution, solution_values);
-            fe_values[velocities].get_function_values(old_solution, old_solution_values);
+            fe_values[velocities].get_function_values(solution_a, solution_a_values);
+            fe_values[velocities].get_function_values(solution_b, solution_b_values);
 
             diff = 0;
             for (unsigned int q = 0; q < n_q_points; ++q) {
                 for (unsigned int d = 0; d < dim; ++d) {
-                    diff += (pow(old_solution_values[q][d] - solution_values[q][d], 2) * fe_values.JxW(q));
+                    diff += (pow(solution_b_values[q][d] - solution_a_values[q][d], 2) * fe_values.JxW(q));
                 }
             }
             erroL2 += diff;
@@ -230,15 +240,9 @@ class NavierStokesCG {
         return sqrt(erroL2);
     }
 
-    /*
-     * Calcula erro na norma L2 entre duas soluções
-     */
     void condicao_inicial() {
-        constraints.clear();
-        ExactSolution<dim> solution_function;
-        solution_function.set_time(time);
-        constraints.close();
-        VectorTools::project(dof_handler, constraints, QGauss<dim>(degree + 1), solution_function, prev_solution);
+        BoundaryValues<dim> boundary_function;
+        VectorTools::project(dof_handler, constraints, QGauss<dim>(degree + 1), boundary_function, prev_solution);
     }
 
     /**
@@ -286,10 +290,9 @@ class NavierStokesCG {
      */
     void inicia_condicao_contorno() {
         constraints.clear();
-        ExactSolution<dim> solution_function;
-        solution_function.set_time(time);
+        BoundaryValues<dim> boundary_function;
         FEValuesExtractors::Vector velocity(0);
-        VectorTools::interpolate_boundary_values(dof_handler, 0, solution_function, constraints, fe.component_mask(velocity));
+        VectorTools::interpolate_boundary_values(dof_handler, 0, boundary_function, constraints, fe.component_mask(velocity));
         constraints.close();
     }
 
@@ -405,6 +408,7 @@ class NavierStokesCG {
                                                    system_matrix, system_rhs);
         }
     }
+
     void solve() {
         SparseDirectUMFPACK A_direct;
         A_direct.initialize(system_matrix);
@@ -413,52 +417,6 @@ class NavierStokesCG {
         // Impõe as condições de contorno no vetor solução que ficaram guardadas nele
         // na fase de construção
         constraints.distribute(solution);
-    }
-
-    void compute_errors(ConvergenceTable &convergence_table) {
-        const ComponentSelectFunction<dim> pressure_mask(dim, dim + 1);
-        const ComponentSelectFunction<dim> velocity_mask(std::make_pair(0, dim),
-                                                         dim + 1);
-        ExactSolution<dim> exact_solution;
-        exact_solution.set_time(time);
-        Vector<double> cellwise_errors(triangulation.n_active_cells());
-        QGauss<dim> quadrature(degree + 1);
-
-        const double mean_pressure = VectorTools::compute_mean_value(dof_handler, quadrature, solution, dim);
-        std::cout << "   Note: The mean value was adjusted by " << -mean_pressure << std::endl;
-        solution.block(1).add(-mean_pressure);
-
-        VectorTools::integrate_difference(dof_handler,
-                                          solution,
-                                          exact_solution,
-                                          cellwise_errors,
-                                          quadrature,
-                                          VectorTools::L2_norm,
-                                          &pressure_mask);
-        const double p_l2_error =
-            VectorTools::compute_global_error(triangulation,
-                                              cellwise_errors,
-                                              VectorTools::L2_norm);
-        VectorTools::integrate_difference(dof_handler,
-                                          solution,
-                                          exact_solution,
-                                          cellwise_errors,
-                                          quadrature,
-                                          VectorTools::L2_norm,
-                                          &velocity_mask);
-        const double u_l2_error =
-            VectorTools::compute_global_error(triangulation,
-                                              cellwise_errors,
-                                              VectorTools::L2_norm);
-
-        std::cout << "Errors: ||e_u||_L2 = " << u_l2_error
-                  << ",   ||e_p||_L2 = " << p_l2_error
-                  << std::endl
-                  << std::endl;
-
-        convergence_table.add_value("cells", triangulation.n_active_cells());
-        convergence_table.add_value("L2_u", u_l2_error);
-        convergence_table.add_value("L2_p", p_l2_error);
     }
 
     bool create_dir(std::string path) const {
@@ -503,46 +461,11 @@ int main() {
     using namespace dealii;
     using namespace CGNS;
 
-    ConvergenceTable convergence_table;
-
     const int dim = 2;
+    const int i = 3;
 
-    for (int i = 2; i < 6; ++i) {
-        NavierStokesCG<dim> problem(1);
-        problem.run(i, convergence_table);
-    }
-    convergence_table.set_precision("L2_u", 3);
-    convergence_table.set_scientific("L2_u", true);
-    convergence_table.evaluate_convergence_rates("L2_u", "cells", ConvergenceTable::reduction_rate_log2, dim);
-
-    convergence_table.set_precision("L2_p", 3);
-    convergence_table.set_scientific("L2_p", true);
-    convergence_table.evaluate_convergence_rates("L2_p", "cells", ConvergenceTable::reduction_rate_log2, dim);
-
-    convergence_table.write_text(std::cout);
-
-    std::ofstream data_output("taxas.dat");
-    convergence_table.write_text(data_output);
-
-    std::ofstream tex_output("taxas.tex");
-    convergence_table.write_tex(tex_output);
+    NavierStokesCG<dim> problem(1);
+    problem.run(i);
 
     return 0;
 }
-
-/*
-Função laplaciano
-
-// No assemble
-std::vector<Tensor<1,dim>> lap_phi_j_u(dofs_per_cell);
-std::vector<Tensor<3,dim>> hess_phi_j_u(dofs_per_cell);
-
-for (unsigned int i = 0; i < dofs_per_cell; ++i){
-    hess_phi_j_u[i] = fe_values[velocities].hessian(i, q);
-    for (int d = 0; d < dim; ++d)
-        lap_phi_j_u[i][d] = trace(hess_phi_j_u[i][d]);
-}
-
-1º Fazer o SUPG nesse código transiente
-2º PSPG
-*/

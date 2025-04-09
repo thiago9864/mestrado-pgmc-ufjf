@@ -15,6 +15,7 @@
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_in.h>  // gmsh
 #include <deal.II/grid/grid_out.h>
+#include <deal.II/grid/grid_refinement.h>
 #include <deal.II/grid/grid_tools.h>
 #include <deal.II/grid/tria.h>
 #include <deal.II/grid/tria_accessor.h>
@@ -27,7 +28,9 @@
 #include <deal.II/lac/sparse_direct.h>
 #include <deal.II/numerics/data_out.h>
 #include <deal.II/numerics/data_out_faces.h>
+#include <deal.II/numerics/error_estimator.h>
 #include <deal.II/numerics/matrix_tools.h>
+#include <deal.II/numerics/solution_transfer.h>
 #include <deal.II/numerics/vector_tools.h>
 #include <math.h>
 
@@ -38,9 +41,9 @@ namespace CGNS {
 using namespace dealii;
 
 // Parâmetros do problema
-double visc = 0.025;
+double visc = 0.0025;
 double rho = 1.0;
-double time_end = 1.0;
+double time_end = 10.0;
 double omega_init = 0.0;
 double omega_fim = 1.0;
 
@@ -61,27 +64,28 @@ class RightHandSide : public Function<dim> {
     }
 };
 
-/*
- * Classe que contem a representação da solução exata do problema
- */
 template <int dim>
-class ExactSolution : public Function<dim> {
+class BoundaryValues : public Function<dim> {
    public:
-    ExactSolution() : Function<dim>(dim + 1) {}
+    double d = 1e-10;
+
+   public:
+    BoundaryValues() : Function<dim>(dim + 1) {}
 
     virtual void vector_value(const Point<dim> &p, Vector<double> &values) const {
         Assert(values.size() == dim + 1, ExcDimensionMismatch(values.size(), dim + 1));
-
-        double re = 1.0 / visc;
-
         // ux
-        values[0] = -cos(M_PI * p[0]) * sin(M_PI * p[1]) * exp((-2. * M_PI * M_PI * this->get_time()) / re);
+        values[0] = 0.0;
 
         // uy
-        values[1] = sin(M_PI * p[0]) * cos(M_PI * p[1]) * exp((-2. * M_PI * M_PI * this->get_time()) / re);
+        values[1] = 0.0;
 
         // p
-        values[dim] = -0.25 * (cos(2. * M_PI * p[0]) + cos(2. * M_PI * p[1])) * exp((-4. * M_PI * M_PI * this->get_time()) / re);
+        values[dim] = 0.0;
+
+        if (abs(p[1] - omega_fim) < d) {
+            values[0] = 1.0;
+        }
     }
 };
 
@@ -102,40 +106,43 @@ class NavierStokesCG {
 
     /*
      * Função de execução principal
-     * @i Grau de refinamento da malha -> 2^i elementos
-     * @convergence_table Tabela de convergência
+     * @i Grau de refinamento da malha -> 2^(dim*i) elementos
      */
-    void run(int i, ConvergenceTable &convergence_table) {
+    void run(int i) {
         int num_it;
         double delta;
 
         // Inicializa malha
-        make_grid_and_dofs(i);
+        // Aqui define o tamanho do domínio, nessa função hyper_cube
+        GridGenerator::hyper_cube(triangulation, omega_init, omega_fim);
+        triangulation.refine_global(i);
+
+        setup_dofs();
+        initialize_system();
 
         // Gera solução pro passo 0
         time = 0.0;
         timestep_number = 0;
-        inicia_condicao_contorno();
         condicao_inicial();
         old_solution = prev_solution;
         solution = prev_solution;
         output_results(i);
 
-        // Define o tamanho do passo de tempo proporcional ao valor de h
-        double h_mesh = GridTools::maximal_cell_diameter(triangulation);
-        time_step = pow(h_mesh, degree + 1);
+        time_step = 0.1;
         time_max_number = round(time_end / time_step);
 
-        printf("Usando o delta t=%f, com h=%f\n", time_step, h_mesh);
+        printf("Usando o delta t=%f\n", time_step);
+        printf("Num de Reynolds=%f\n", 1.0 / visc);
         printf("Execução em %d passos de tempo\n", time_max_number);
 
         // Incluir aqui mais um loop pro tempo (etapa 3)
-        for (timestep_number = 1; timestep_number < time_max_number; timestep_number++) {
+        for (timestep_number = 1; condicao_de_parada(false); timestep_number++) {
             time += time_step;
             num_it = 0;
-            // old_solution = 0;
-            inicia_condicao_contorno();
 
+            // if (timestep_number == 10) {
+            //     time_step = 0.1;
+            // }
             // printf("dt=%f, t=%f\n", time_step, time);
 
             // Metodo de Picard
@@ -148,10 +155,11 @@ class NavierStokesCG {
                 solve();
 
                 // Calcula diferença entre as soluções com a norma L2 discreta
-                delta = erro_norma_L2();
+                delta = erro_norma_L2(solution, old_solution);
 
                 // Salva cópia da solução obtida
-                old_solution.block(0) = solution.block(0);
+                // old_solution.block(0) = solution.block(0);
+                old_solution = solution;
 
                 num_it++;
                 if (num_it > 100) {
@@ -161,20 +169,30 @@ class NavierStokesCG {
                 }
             } while (delta > 1e-6);
 
-            // Armazena solução em u^{n}
-            prev_solution.block(0) = solution.block(0);
-
             printf("Problema nao linear com %d células, resolvido no passo de tempo %d, com %d iteracoes\n",
                    triangulation.n_active_cells(),
                    timestep_number,
                    num_it);
 
-            // if (timestep_number == time_max_number - 1) {
-            //     compute_errors(convergence_table);
-            // }
+            // Salva solução no passo de tempo
+            output_results(i);
+
+            // Refinamento de malha
+            if (timestep_number <= 3 || timestep_number % 10 == 0) {
+                refine_grid();
+            } else {
+                printf("Pula Refinamento\n");
+            }
+
+            // Armazena solução em u^{n}
+            prev_solution = solution;
+            // Inicia solução anterior do método de Picard (u^{n+1 (bar)} = u^{n})
+            old_solution = solution;
         }
-        output_results(i);
-        compute_errors(convergence_table);
+
+        // Escreve como svg a malha final
+        std::ofstream mesh_svg_file("mesh_final" + std::to_string(i) + ".svg");
+        GridOut().write_svg(triangulation, mesh_svg_file);
     }
 
    private:
@@ -189,14 +207,31 @@ class NavierStokesCG {
     BlockVector<double> old_solution;
     BlockVector<double> system_rhs;
     AffineConstraints<double> constraints;
+    std::vector<types::global_dof_index> dofs_per_block;
     double time_step;
     double time;
     unsigned int timestep_number;
+    double ref_error;
+    double ref_error_prev;
+
+    /**
+     * Condição de parada do for do tempo
+     * @is_aprox_estacionario True considera um erro entre u^n+1 e u^n menor que uma tolerancia,
+     * False usa a contagem de passos até o tempo máximo indicado na variavel 'time_end'
+     */
+    bool condicao_de_parada(bool is_aprox_estacionario) {
+        if (is_aprox_estacionario) {
+            double delta = erro_norma_L2(solution, prev_solution);
+            return timestep_number <= 2 || delta > 1e-6;
+        } else {
+            return timestep_number <= time_max_number;
+        }
+    }
 
     /*
      * Calcula erro na norma L2 entre duas soluções
      */
-    double erro_norma_L2() {
+    double erro_norma_L2(BlockVector<double> solution_a, BlockVector<double> solution_b) {
         double erroL2 = 0.0;
         double diff;
 
@@ -207,21 +242,21 @@ class NavierStokesCG {
         const unsigned int n_q_points = quadrature_formula.size();
 
         // posições na celula atual
-        std::vector<Tensor<1, dim>> old_solution_values(n_q_points);
-        std::vector<Tensor<1, dim>> solution_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_a_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_b_values(n_q_points);
 
         const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
 
         for (const auto &cell : dof_handler.active_cell_iterators()) {
             fe_values.reinit(cell);
 
-            fe_values[velocities].get_function_values(solution, solution_values);
-            fe_values[velocities].get_function_values(old_solution, old_solution_values);
+            fe_values[velocities].get_function_values(solution_a, solution_a_values);
+            fe_values[velocities].get_function_values(solution_b, solution_b_values);
 
             diff = 0;
             for (unsigned int q = 0; q < n_q_points; ++q) {
                 for (unsigned int d = 0; d < dim; ++d) {
-                    diff += (pow(old_solution_values[q][d] - solution_values[q][d], 2) * fe_values.JxW(q));
+                    diff += (pow(solution_b_values[q][d] - solution_a_values[q][d], 2) * fe_values.JxW(q));
                 }
             }
             erroL2 += diff;
@@ -230,67 +265,56 @@ class NavierStokesCG {
         return sqrt(erroL2);
     }
 
-    /*
-     * Calcula erro na norma L2 entre duas soluções
-     */
     void condicao_inicial() {
-        constraints.clear();
-        ExactSolution<dim> solution_function;
-        solution_function.set_time(time);
-        constraints.close();
-        VectorTools::project(dof_handler, constraints, QGauss<dim>(degree + 1), solution_function, prev_solution);
+        BoundaryValues<dim> boundary_function;
+        VectorTools::project(dof_handler, constraints, QGauss<dim>(degree + 1), boundary_function, prev_solution);
     }
 
     /**
-     * Inicializa a malha e inclui os pontos locais e globais de cada nó
+     * inclui os pontos locais e globais de cada nó
      */
-    void make_grid_and_dofs(int i) {
-        // Aqui define o tamanho do domínio, nessa função hyper_cube
-        GridGenerator::hyper_cube(triangulation, omega_init, omega_fim);
-        triangulation.refine_global(i);
+    void setup_dofs() {
+        system_matrix.clear();
+
         dof_handler.distribute_dofs(fe);
 
+        // Configura blocos para velocidade e pressão
         std::vector<unsigned int> block_component(dim + 1, 0);
         block_component[dim] = 1;
         DoFRenumbering::component_wise(dof_handler, block_component);
-        const std::vector<types::global_dof_index> dofs_per_block =
-            DoFTools::count_dofs_per_fe_block(dof_handler, block_component);
+        dofs_per_block = DoFTools::count_dofs_per_fe_block(dof_handler, block_component);
 
         const unsigned int n_u = dofs_per_block[0],
                            n_p = dofs_per_block[1];
+
+        // Condição de contorno
+        constraints.clear();
+
+        DoFTools::make_hanging_node_constraints(dof_handler, constraints);
+
+        BoundaryValues<dim> boundary_function;
+        FEValuesExtractors::Vector velocity(0);
+        VectorTools::interpolate_boundary_values(dof_handler, 0, boundary_function, constraints, fe.component_mask(velocity));
+
+        constraints.close();
 
         std::cout << "Number of active cells: " << triangulation.n_active_cells()
                   << std::endl
                   << "Number of degrees of freedom: " << dof_handler.n_dofs()
                   << " (" << n_u << '+' << n_p << ')' << std::endl
                   << std::endl;
-
-        prev_solution.reinit(dofs_per_block);
-        solution.reinit(dofs_per_block);
-        system_rhs.reinit(dofs_per_block);
-        old_solution.reinit(dofs_per_block);
-
-        BlockDynamicSparsityPattern dsp(dofs_per_block, dofs_per_block);
-        DoFTools::make_sparsity_pattern(dof_handler, dsp);
-
-        sparsity_pattern.copy_from(dsp);
-        system_matrix.reinit(sparsity_pattern);
-
-        // Escreve como svg
-        // std::ofstream mesh_svg_file("mesh" + std::to_string(i) + ".svg");
-        // GridOut().write_svg(triangulation, mesh_svg_file);
     }
 
-    /**
-     * Inicia condição de contorno com o tempo atual do problema
-     */
-    void inicia_condicao_contorno() {
-        constraints.clear();
-        ExactSolution<dim> solution_function;
-        solution_function.set_time(time);
-        FEValuesExtractors::Vector velocity(0);
-        VectorTools::interpolate_boundary_values(dof_handler, 0, solution_function, constraints, fe.component_mask(velocity));
-        constraints.close();
+    void initialize_system() {
+        BlockDynamicSparsityPattern dsp(dofs_per_block, dofs_per_block);
+        DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints);
+        sparsity_pattern.copy_from(dsp);
+
+        system_matrix.reinit(sparsity_pattern);
+        system_rhs.reinit(dofs_per_block);
+        prev_solution.reinit(dofs_per_block);
+        old_solution.reinit(dofs_per_block);
+        solution.reinit(dofs_per_block);
     }
 
     void assemble_system() {
@@ -300,8 +324,10 @@ class NavierStokesCG {
                                 quadrature_formula,
                                 update_values | update_gradients | update_hessians |
                                     update_quadrature_points | update_JxW_values);
+
         const unsigned int dofs_per_cell = fe.dofs_per_cell;
         const unsigned int n_q_points = quadrature_formula.size();
+
         FullMatrix<double> local_matrix(dofs_per_cell, dofs_per_cell);
         Vector<double> local_rhs(dofs_per_cell);
         std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
@@ -333,15 +359,12 @@ class NavierStokesCG {
             fe_values[velocities].get_function_values(prev_solution, prev_solution_values);
 
             // tau
+            double h_mesh_min = GridTools::minimal_cell_diameter(triangulation);
             const double u_norm = old_solution.l2_norm();
+            const double h_diff = h_mesh_min;
+            const double h_conv = h_mesh_min;
 
-            double h;
-            if (dim == 2)
-                h = std::sqrt(4. * cell->measure() / M_PI) / degree;
-            else if (dim == 3)
-                h = std::pow(6. * cell->measure() / M_PI, 1. / 3.) / degree;
-
-            const double tau_u = pow(pow(1.0 / time_step, 2) + pow((2.0 * u_norm) / h, 2) + ((4.0 * visc) / (3.0 * h)), -0.5);
+            const double tau_u = pow(pow(1.0 / time_step, 2) + pow((2.0 * u_norm) / h_conv, 2) + ((4.0 * visc) / (3.0 * h_diff)), -0.5);
 
             for (unsigned int q = 0; q < n_q_points; ++q) {
                 for (unsigned int i = 0; i < dofs_per_cell; ++i) {
@@ -402,9 +425,11 @@ class NavierStokesCG {
             constraints.distribute_local_to_global(local_matrix,
                                                    local_rhs,
                                                    local_dof_indices,
-                                                   system_matrix, system_rhs);
+                                                   system_matrix,
+                                                   system_rhs);
         }
     }
+
     void solve() {
         SparseDirectUMFPACK A_direct;
         A_direct.initialize(system_matrix);
@@ -415,50 +440,111 @@ class NavierStokesCG {
         constraints.distribute(solution);
     }
 
-    void compute_errors(ConvergenceTable &convergence_table) {
-        const ComponentSelectFunction<dim> pressure_mask(dim, dim + 1);
-        const ComponentSelectFunction<dim> velocity_mask(std::make_pair(0, dim),
-                                                         dim + 1);
-        ExactSolution<dim> exact_solution;
-        exact_solution.set_time(time);
-        Vector<double> cellwise_errors(triangulation.n_active_cells());
-        QGauss<dim> quadrature(degree + 1);
+    void calcula_refinamento(Vector<float> estimated_error_per_cell) {
+        double fracao_dividir = 0.3;
+        double fracao_mesclar = 0.03 * ((timestep_number / 10.0) + 1.0);
+        unsigned int limite_celulas = 16384;
+        double min_area_cell = pow((omega_fim - omega_init) / 128.0, 2);
+        int teste = 0;
 
-        const double mean_pressure = VectorTools::compute_mean_value(dof_handler, quadrature, solution, dim);
-        std::cout << "   Note: The mean value was adjusted by " << -mean_pressure << std::endl;
-        solution.block(1).add(-mean_pressure);
+        // Estratégia pronta do dealii
+        GridRefinement::refine_and_coarsen_fixed_number(triangulation,
+                                                        estimated_error_per_cell,
+                                                        fracao_dividir,   // Dividir células com maior erro
+                                                        fracao_mesclar,   // Mesclar células com menor erro
+                                                        limite_celulas);  // Número máximo de células na malha
 
-        VectorTools::integrate_difference(dof_handler,
-                                          solution,
-                                          exact_solution,
-                                          cellwise_errors,
-                                          quadrature,
-                                          VectorTools::L2_norm,
-                                          &pressure_mask);
-        const double p_l2_error =
-            VectorTools::compute_global_error(triangulation,
-                                              cellwise_errors,
-                                              VectorTools::L2_norm);
-        VectorTools::integrate_difference(dof_handler,
-                                          solution,
-                                          exact_solution,
-                                          cellwise_errors,
-                                          quadrature,
-                                          VectorTools::L2_norm,
-                                          &velocity_mask);
-        const double u_l2_error =
-            VectorTools::compute_global_error(triangulation,
-                                              cellwise_errors,
-                                              VectorTools::L2_norm);
+        // Desmarca refinamento de células com area menor que o limite
+        for (const auto &cell : dof_handler.active_cell_iterators()) {
+            const unsigned int cell_no = cell->active_cell_index();
+ 
+            if(cell->measure() <= min_area_cell){
+                cell->clear_refine_flag();
+                teste++;
+            }
+        }
 
-        std::cout << "Errors: ||e_u||_L2 = " << u_l2_error
-                  << ",   ||e_p||_L2 = " << p_l2_error
-                  << std::endl
-                  << std::endl;
+        printf("%d celulas já chegaram no tamanho mínimo\n", teste);
+    }
 
-        convergence_table.add_value("cells", triangulation.n_active_cells());
-        convergence_table.add_value("L2_u", u_l2_error);
-        convergence_table.add_value("L2_p", p_l2_error);
+    //
+
+    void refine_grid() {
+        Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
+        const FEValuesExtractors::Vector velocity(0);
+
+        KellyErrorEstimator<dim>::estimate(
+            dof_handler,
+            QGauss<dim - 1>(degree + 1),
+            std::map<types::boundary_id, const Function<dim> *>(),
+            solution,
+            estimated_error_per_cell,
+            fe.component_mask(velocity));
+
+        double max = estimated_error_per_cell[0];
+        double min = estimated_error_per_cell[0];
+        ref_error = 0;
+        for (int i = 0; i < estimated_error_per_cell.size(); i++) {
+            if (estimated_error_per_cell[i] >= max) {
+                max = estimated_error_per_cell[i];
+            } else if (estimated_error_per_cell[i] < min) {
+                min = estimated_error_per_cell[i];
+            }
+            ref_error += estimated_error_per_cell[i];
+        }
+        // Calcula erro médio
+        // ref_error /= estimated_error_per_cell.size();
+
+        ref_error = max;
+
+        printf("Max error: %f, Min error: %f\n", max, min);
+        printf("*** Aplica Refinamento ***\n");
+
+        calcula_refinamento(estimated_error_per_cell);
+
+        // double fracao_dividir = 0.3;
+        // double fracao_mesclar = 0.03 * ((timestep_number / 10.0) + 1.0);
+        // unsigned int limite_celulas = 1000;
+
+        // if (abs(ref_error - ref_error_prev) > 3e-3) {
+        // if (timestep_number <= 3 || timestep_number % 10 == 0) {
+        //printf("*** Aplica Refinamento div=%f, mesc=%f***\n", fracao_dividir, fracao_mesclar);
+        // printf("*** Aplica Refinamento E: %f, Ep: %f, D: %f ***\n", ref_error, ref_error_prev, abs(ref_error - ref_error_prev));
+        //  Faz o refinamento se o erro for alto entre um passo e outro
+        // GridRefinement::refine_and_coarsen_fixed_number(triangulation,
+        //                                                 estimated_error_per_cell,
+        //                                                 fracao_dividir,   // Dividir células com maior erro
+        //                                                 fracao_mesclar,   // Mesclar células com menor erro
+        //                                                 limite_celulas);  // Número máximo de células na malha
+        // ref_error_prev = ref_error;
+        // } else {
+        //     printf("*** Pula Refinamento ***\n");
+        //     // printf("*** Pula Refinamento E: %f, Ep: %f, D: %f ***\n", ref_error, ref_error_prev, abs(ref_error - ref_error_prev));
+        //     //  Se o erro for baixo, não faz refinamento
+        // }
+
+        triangulation.prepare_coarsening_and_refinement();
+        SolutionTransfer<dim, BlockVector<double>> solution_transfer(dof_handler);
+        solution_transfer.prepare_for_coarsening_and_refinement(solution);
+        triangulation.execute_coarsening_and_refinement();
+
+        // First the DoFHandler is set up and constraints are generated. Then we
+        // create a temporary BlockVector <code>tmp</code>, whose size is
+        // according with the solution on the new mesh.
+        setup_dofs();
+
+        BlockVector<double> tmp(dofs_per_block);
+
+        // Transfer solution from coarse to fine mesh and apply boundary value
+        // constraints to the new transferred solution. Note that 'solution'
+        // is still a vector corresponding to the old mesh.
+        solution_transfer.interpolate(solution, tmp);
+        constraints.distribute(tmp);
+
+        // Finally set up matrix and vectors and set 'solution' to the
+        // interpolated data.
+        initialize_system();
+        solution = tmp;
     }
 
     bool create_dir(std::string path) const {
@@ -503,29 +589,11 @@ int main() {
     using namespace dealii;
     using namespace CGNS;
 
-    ConvergenceTable convergence_table;
-
     const int dim = 2;
+    const int i = 3;
 
-    for (int i = 2; i < 6; ++i) {
-        NavierStokesCG<dim> problem(1);
-        problem.run(i, convergence_table);
-    }
-    convergence_table.set_precision("L2_u", 3);
-    convergence_table.set_scientific("L2_u", true);
-    convergence_table.evaluate_convergence_rates("L2_u", "cells", ConvergenceTable::reduction_rate_log2, dim);
-
-    convergence_table.set_precision("L2_p", 3);
-    convergence_table.set_scientific("L2_p", true);
-    convergence_table.evaluate_convergence_rates("L2_p", "cells", ConvergenceTable::reduction_rate_log2, dim);
-
-    convergence_table.write_text(std::cout);
-
-    std::ofstream data_output("taxas.dat");
-    convergence_table.write_text(data_output);
-
-    std::ofstream tex_output("taxas.tex");
-    convergence_table.write_tex(tex_output);
+    NavierStokesCG<dim> problem(1);
+    problem.run(i);
 
     return 0;
 }
