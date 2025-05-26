@@ -1,0 +1,10 @@
+visc = 0.0025
+rho = 1.0
+time_end = 40.0
+time_step = 0.1
+omega_init = 0.0
+omega_fim = 1.0
+delta_aprox_estatico = 1e-7
+refinamento_inicial = 3
+is_aprox_estacionario = 0
+lado_matriz_limite = 70

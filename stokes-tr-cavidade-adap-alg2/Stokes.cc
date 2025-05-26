@@ -33,22 +33,13 @@
 #include <deal.II/numerics/solution_transfer.h>
 #include <deal.II/numerics/vector_tools.h>
 #include <math.h>
+#include <ncurses.h>
 
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 namespace CGNS {
 using namespace dealii;
-
-// Parâmetros do problema
-// double visc = 0.0025;
-// double rho = 1.0;
-// double time_end = 10.0;
-// double omega_init = 0.0;
-// double omega_fim = 1.0;
-
-// double delta_aprox_estatico = 1e-8;
-// unsigned int time_max_number;
 
 double visc;
 double rho;
@@ -60,7 +51,10 @@ unsigned int time_max_number;
 bool is_aprox_estacionario;
 double time_step;
 int refinamento_inicial;
-int lado_matriz_limite;
+int limite_nivel_refinamento;
+int intervalo_malhas_min;
+int intervalo_malhas_max;
+int degree_exec;
 
 /*
  * Classe que contém a representação da função do lado direito da equação de Stokes
@@ -124,18 +118,24 @@ class NavierStokesCG {
     void run() {
         int num_it, passo, passo_output;
         double delta;
+        int passos_entre_refinamentos = 1;
+
+        alpha_pe_map.clear();
+        malha_dif_map.clear();
+        malha_int_map.clear();
+        num_celulas_map.clear();
 
         printf("\n***Inicia a execucao***\n");
-
-        // Limita a célula a não ser menor do que uma equivalente em uma grade de 128x128
-        // assumindo malha quadrada uniforme.
-        limite_celulas = lado_matriz_limite * lado_matriz_limite;
-        min_area_cell = pow((omega_fim - omega_init) / sqrt(limite_celulas), 2);
 
         // Inicializa malha
         // Aqui define o tamanho do domínio, nessa função hyper_cube
         GridGenerator::hyper_cube(triangulation, omega_init, omega_fim);
         triangulation.refine_global(refinamento_inicial);
+
+        // Inicia vetores do detector de oscilação
+        int max_cells = std::pow(4, limite_nivel_refinamento);
+        direcao_nivel_map = std::vector<int>(max_cells, 0);
+        loops_nivel_map = std::vector<int>(max_cells, 0);
 
         setup_dofs();
         initialize_system();
@@ -143,18 +143,21 @@ class NavierStokesCG {
         // Gera solução pro passo 0
         time = 0.0;
         timestep_number = 0;
+        reynolds = 1.0 / visc;
         condicao_inicial();
         old_solution = prev_solution;
         solution = prev_solution;
+        ref_solution = prev_solution;
         output_results();
 
         time_max_number = round(time_end / time_step);
-
         passo = 0;
         passo_output = 0;
 
+        max_delta_malha = 0;
+
         printf("Usando o delta t=%f\n", time_step);
-        printf("Num de Reynolds=%f\n", 1.0 / visc);
+        printf("Num de Reynolds=%f\n", reynolds);
 
         if (!is_aprox_estacionario) {
             printf("Execução em %d passos de tempo\n", time_max_number);
@@ -167,8 +170,6 @@ class NavierStokesCG {
         for (timestep_number = 1; condicao_de_parada(is_aprox_estacionario); timestep_number++) {
             time += time_step;
             num_it = 0;
-            passo++;
-            passo_output++;
 
             // Armazena solução em u^{n}
             prev_solution = solution;
@@ -199,56 +200,59 @@ class NavierStokesCG {
                 }
             } while (delta > 1e-6);
 
-            printf("Problema nao linear com %d células, resolvido no passo de tempo %d (%.2f), com %d iteracoes\n",
+            printf("\nProblema nao linear com %d células, resolvido no passo de tempo %d (%.2f), com %d iteracoes\n",
                    triangulation.n_active_cells(),
                    timestep_number,
                    time,
                    num_it);
 
+            // Acrescenta um intervalo no salvamento das soluções de forma que
+            // um delta t pequeno não gere muitas soluções
             int multPassos = std::round(0.1 / time_step);
             if (multPassos < 1) {
                 multPassos = 1;
             }
-            if (passo_output >= multPassos) {
+            multPassos = 10;
+            if (passo_output >= multPassos - 1) {
                 // Salva solução no passo de tempo
                 output_results();
                 passo_output = 0;
+            } else {
+                passo_output++;
             }
-
-            {{1e-5, 45}, {1e-4, 35}, {1e-3, 25},{1e-2, 15}, {1e-1, 5}}
 
             // Estratégia de refinamento
-            int passos_entre_refinamentos = 15;
+            if (passo >= passos_entre_refinamentos) {
+                passos_entre_refinamentos = define_intervalo_entre_refinamentos();
 
-            if (min_delta_entre_timesteps > 1e-2) {
-                passos_entre_refinamentos = 15 * multPassos;
-            } else if (min_delta_entre_timesteps > 1e-3) {
-                passos_entre_refinamentos = 25 * multPassos;
-            } else if (min_delta_entre_timesteps > 1e-4) {
-                passos_entre_refinamentos = 35 * multPassos;
-            } else if (min_delta_entre_timesteps > 1e-5) {
-                passos_entre_refinamentos = 45 * multPassos;
-            } else if (min_delta_entre_timesteps > 1e-6) {
-                passos_entre_refinamentos = 55 * multPassos;
-            } else if (min_delta_entre_timesteps < 1e-6) {
-                passos_entre_refinamentos = 65 * multPassos;
-            }
-
-            if (min_delta_entre_timesteps < 1e-5) {
-                min_delta_entre_timesteps = 0;
-            }
-
-            printf("passos_entre_refinamentos = %d, delta_entre_timesteps = %.2e, min_delta_entre_timesteps = %.2e\n",
-                   passos_entre_refinamentos, delta_entre_timesteps, min_delta_entre_timesteps);
-
-            // Refinamento de malha
-            if (timestep_number <= 3 || (min_delta_entre_timesteps > 0 && passo >= passos_entre_refinamentos)) {
-                passo = 0;
+                // Faz o refinamento
                 refine_grid();
+
+                // Salva estatisticas relevantes
+                grava_estatisticas();
+
+                passo = 0;
             } else {
-                printf("Pula Refinamento\n");
+                // Calcula diferença entre dois passos de tempo
+                delta_entre_timesteps = erro_norma_L2(solution, prev_solution);
+                // delta_entre_timesteps = erro_residuo(solution);
+                // delta_entre_timesteps = erro_kelly(solution);
+                residuo_map.insert(std::make_pair(time, delta_entre_timesteps));
+
+                if (timestep_number <= 2 || delta_entre_timesteps < min_delta_entre_timesteps) {
+                    min_delta_entre_timesteps = delta_entre_timesteps;
+                }
+                printf("Aguardando refinamento: passo %d de %d\n", passo, passos_entre_refinamentos);
+                passo++;
             }
+
+            printf("delta_entre_timesteps = %.2e, min_delta_entre_timesteps = %.2e\n",
+                   delta_entre_timesteps, min_delta_entre_timesteps);
         }
+
+        grava_estatisticas();
+        output_results();
+        gera_solucoes_eixos();
     }
 
     int getNumCells() {
@@ -263,11 +267,46 @@ class NavierStokesCG {
         return timestep_number;
     }
 
+    std::map<double, int> getHashMapNumCelulas() {
+        return num_celulas_map;
+    }
+
+    std::map<double, double> getHashMapAlphaPe() {
+        return alpha_pe_map;
+    }
+
+    std::map<double, double> getHashMapMalhaDiff() {
+        return malha_dif_map;
+    }
+
+    std::map<double, int> getHashMapMalhaInt() {
+        return malha_int_map;
+    }
+
+    std::map<double, double> getHashMapResiduo() {
+        return residuo_map;
+    }
+
+    std::string diretorio_stats() {
+        int reynolds_int = round(reynolds);
+        std::string dir = "stats" + std::to_string(refinamento_inicial);
+        dir += "_ordem" + std::to_string(degree_exec);
+        dir += "_reynolds" + std::to_string(reynolds_int);
+
+        if (!create_dir(dir)) {
+            printf("Erro ao criar diretorio\n");
+            exit(3);
+        }
+        return dir;
+    }
+
     void lerConfiguracoes(std::string arquivo_config) {
         std::string ipName;
         std::ifstream fin(arquivo_config);
         std::string line;
         std::istringstream sin;
+
+        arq_config = arquivo_config;
 
         while (std::getline(fin, line)) {
             sin.str(line.substr(line.find("=") + 1));
@@ -290,8 +329,12 @@ class NavierStokesCG {
                 sin >> is_aprox_estacionario;
             } else if (line.find("refinamento_inicial") != std::string::npos) {
                 sin >> refinamento_inicial;
-            } else if (line.find("lado_matriz_limite") != std::string::npos) {
-                sin >> lado_matriz_limite;
+            } else if (line.find("limite_nivel_refinamento") != std::string::npos) {
+                sin >> limite_nivel_refinamento;
+            } else if (line.find("intervalo_malhas_min") != std::string::npos) {
+                sin >> intervalo_malhas_min;
+            } else if (line.find("intervalo_malhas_max") != std::string::npos) {
+                sin >> intervalo_malhas_max;
             }
             sin.clear();
         }
@@ -304,9 +347,28 @@ class NavierStokesCG {
         printf("delta_aprox_estatico = %.3e\n", delta_aprox_estatico);
         printf("time_step = %f\n", time_step);
         printf("is_aprox_estacionario = %B\n", is_aprox_estacionario);
-        printf("lado_matriz_limite = %d\n", lado_matriz_limite);
+        printf("limite_nivel_refinamento = %d\n", limite_nivel_refinamento);
+        printf("intervalo_malhas_min = %d\n", intervalo_malhas_min);
+        printf("intervalo_malhas_max = %d\n", intervalo_malhas_max);
 
         // exit(2);
+        line.clear();
+        fin.close();
+    }
+
+    void gera_arquivo_saida(double diff) {
+        std::string dir_stats = diretorio_stats();
+
+        std::cout << "Tempo de execucao: " << diff / 1000 << " s" << std::endl;
+
+        // Cria arquivo de conclusão
+        std::ofstream resultado(dir_stats + "/saida.txt");
+        resultado << "Arquivo de configuração usado: " << arq_config << std::endl;
+        resultado << "Tempo de execucao: " << diff / 1000 << " s" << std::endl;
+        resultado << "Numero de células final: " << getNumCells() << std::endl;
+        resultado << "Numero de passos de tempo feitos: " << getPassosTempoSimulado() << std::endl;
+        resultado << "Tempo no ultimo passo: " << getTempoSimulado() << "s" << std::endl;
+        resultado.close();
     }
 
    private:
@@ -320,6 +382,7 @@ class NavierStokesCG {
     BlockVector<double> solution;
     BlockVector<double> old_solution;
     BlockVector<double> system_rhs;
+    BlockVector<double> ref_solution;
     AffineConstraints<double> constraints;
     std::vector<types::global_dof_index> dofs_per_block;
     double time;
@@ -328,7 +391,19 @@ class NavierStokesCG {
     double delta_entre_timesteps = 0;
     double min_delta_entre_timesteps = 1e5;
     double min_area_cell = 0;
+    double alpha_pe = 0;
     std::map<std::string, int> cell_map;
+    double reynolds = 0;
+    std::vector<double> alpha_pe_hist;
+    std::map<double, double> alpha_pe_map;
+    std::map<double, double> malha_dif_map;
+    std::map<double, int> malha_int_map;
+    std::map<double, double> residuo_map;
+    std::map<double, int> num_celulas_map;
+    double max_delta_malha = -1e5;
+    std::vector<int> direcao_nivel_map;
+    std::vector<int> loops_nivel_map;
+    std::string arq_config;
 
     /**
      * Condição de parada do for do tempo
@@ -336,10 +411,6 @@ class NavierStokesCG {
      * False usa a contagem de passos até o tempo máximo indicado na variavel 'time_end'
      */
     bool condicao_de_parada(bool is_aprox_estacionario) {
-        delta_entre_timesteps = erro_norma_L2(solution, prev_solution);
-        if (timestep_number <= 2 || delta_entre_timesteps < min_delta_entre_timesteps) {
-            min_delta_entre_timesteps = delta_entre_timesteps;
-        }
         if (is_aprox_estacionario) {
             return timestep_number <= 2 || delta_entre_timesteps > delta_aprox_estatico;
         } else {
@@ -384,6 +455,72 @@ class NavierStokesCG {
         return sqrt(erroL2);
     }
 
+    double erro_residuo(BlockVector<double> solution_a) {
+        std::vector<Point<dim>> vel_points(1);
+        vel_points[0] = Point<dim>(0.0, 0.0);
+        Quadrature<dim> quadrature(vel_points);
+        FEValues<dim> fe_values(fe, quadrature, update_values | update_gradients | update_hessians);
+        // std::vector<Vector<double>> local_values(quadrature.size(), Vector<double>(dim + 1));
+
+        const unsigned int n_q_points = quadrature.size();
+
+        const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
+        const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
+
+        // Dados na celula atual
+        std::vector<Tensor<1, dim>> solution_atual_u_values(n_q_points);
+        std::vector<Tensor<2, dim>> solution_atual_grad_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_lap_u_values(n_q_points);
+        // std::vector<double> solution_atual_div_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_grad_p_values(n_q_points);
+
+        Tensor<1, dim> residuo;
+        double residuo_medio = 0;
+
+        for (const auto &cell : dof_handler.active_cell_iterators()) {
+            fe_values.reinit(cell);
+
+            fe_values[velocities].get_function_values(solution_a, solution_atual_u_values);
+            fe_values[velocities].get_function_gradients(solution_a, solution_atual_grad_u_values);
+            fe_values[velocities].get_function_laplacians(solution_a, solution_atual_lap_u_values);
+            //  fe_values[velocities].get_function_divergences(solution_a, solution_atual_div_u_values);
+            fe_values[pressure].get_function_gradients(solution_a, solution_atual_grad_p_values);
+
+            residuo = (rho * solution_atual_grad_u_values[0] * solution_atual_u_values[0]  // Termo convectivo
+                       - visc * solution_atual_lap_u_values[0]                             // Termo difusivo
+                       + solution_atual_grad_p_values[0]                                   // Termo da pressão
+            );
+
+            // Calculo da média do resíduo
+            residuo_medio += residuo.norm();
+        }
+
+        // Termina o calculo da média do resíduo
+        return residuo_medio / triangulation.n_active_cells();
+    }
+
+    double erro_kelly(BlockVector<double> solution_a) {
+        Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
+        const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
+
+        KellyErrorEstimator<dim>::estimate(
+            dof_handler,
+            QGauss<dim - 1>(degree + 1),
+            std::map<types::boundary_id, const Function<dim> *>(),
+            solution_a,
+            estimated_error_per_cell,
+            fe.component_mask(velocities));
+
+        double erro_medio = 0;
+        int i;
+        for (i = 0; i < triangulation.n_active_cells(); i++) {
+            erro_medio += estimated_error_per_cell[i];
+        }
+
+        // Termina o calculo da média do resíduo
+        return erro_medio / triangulation.n_active_cells();
+    }
+
     /**
      * Condição inicial do problema
      */
@@ -425,6 +562,8 @@ class NavierStokesCG {
                   << "Number of degrees of freedom: " << dof_handler.n_dofs()
                   << " (" << n_u << '+' << n_p << ')' << std::endl
                   << std::endl;
+
+        num_celulas_map.insert(std::make_pair(time, triangulation.n_active_cells()));
     }
 
     void initialize_system() {
@@ -469,7 +608,6 @@ class NavierStokesCG {
         const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
 
         const double rho_dt = rho / time_step;
-
         const double u_norm = old_solution.l2_norm();
 
         for (const auto &cell : dof_handler.active_cell_iterators()) {
@@ -565,178 +703,12 @@ class NavierStokesCG {
         constraints.distribute(solution);
     }
 
-    void residuo_L2(BlockVector<double> solution_atual, BlockVector<double> solution_ant, Vector<float> &estimated_error_per_cell, std::string &python_args) {
-        double res_time, res_conv, res_dif, res_pre, aux_res, res_eq;
-        double aux_time, aux_conv, aux_dif, aux_pre;
-        int i;
-
-        std::vector<std::vector<double>> componentes(
-            estimated_error_per_cell.size(),
-            std::vector<double>(5, 0.0));
-
-        std::vector<std::string> mesh_info(estimated_error_per_cell.size());
-
-        Vector<int> cell_indexes(estimated_error_per_cell.size());
-        QGauss<dim> quadrature_formula(degree + 1);
-        // QGauss<dim - 1> face_quadrature_formula(degree + 1);
-        FEValues<dim> fe_values(fe,
-                                quadrature_formula,
-                                update_values | update_gradients | update_hessians |
-                                    update_quadrature_points | update_JxW_values);
-
-        const unsigned int n_q_points = quadrature_formula.size();
-
-        // posições na celula atual
-        std::vector<Tensor<1, dim>> solution_ant_u_values(n_q_points);
-        std::vector<Tensor<1, dim>> solution_atual_u_values(n_q_points);
-        std::vector<Tensor<2, dim>> solution_atual_grad_u_values(n_q_points);
-        std::vector<Tensor<1, dim>> solution_atual_lap_u_values(n_q_points);
-        // std::vector<double> solution_atual_div_u_values(n_q_points);
-        std::vector<Tensor<1, dim>> solution_atual_grad_p_values(n_q_points);
-
-        const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
-        const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
-
-        Tensor<1, dim> q_time;
-        Tensor<1, dim> q_conv;
-        Tensor<1, dim> q_dif;
-        Tensor<1, dim> q_pre;
-        i = 0;
-
-        for (const auto &cell : dof_handler.active_cell_iterators()) {
-            fe_values.reinit(cell);
-
-            fe_values[velocities].get_function_values(solution_ant, solution_ant_u_values);
-            fe_values[velocities].get_function_values(solution_atual, solution_atual_u_values);
-            fe_values[velocities].get_function_gradients(solution_atual, solution_atual_grad_u_values);
-            fe_values[velocities].get_function_laplacians(solution_atual, solution_atual_lap_u_values);
-            //  fe_values[velocities].get_function_divergences(solution_atual, solution_atual_div_u_values);
-            fe_values[pressure].get_function_gradients(solution_atual, solution_atual_grad_p_values);
-
-            res_time = 0;
-            res_conv = 0;
-            res_dif = 0;
-            res_pre = 0;
-            res_eq = 0;
-
-            for (unsigned int q = 0; q < n_q_points; ++q) {
-                q_time = rho * (solution_atual_u_values[q] - solution_ant_u_values[q]) / time_step;  // Termo no tempo
-                q_conv = rho * solution_atual_grad_u_values[q] * solution_atual_u_values[q];         // Termo convectivo
-                q_dif = visc * solution_atual_lap_u_values[q];                                       // Termo difusivo
-                q_pre = solution_atual_grad_p_values[q];                                             // Termo da pressão
-
-                aux_time = 0;
-                aux_conv = 0;
-                aux_dif = 0;
-                aux_pre = 0;
-                aux_res = 0;
-
-                for (unsigned int d = 0; d < dim; ++d) {
-                    aux_time += q_time[d];
-                    aux_conv += q_conv[d];
-                    aux_dif += q_dif[d];
-                    aux_pre += q_pre[d];
-                    // aux_time += pow(q_time[d], 2) * fe_values.JxW(q);
-                    // aux_conv += pow(q_conv[d], 2) * fe_values.JxW(q);
-                    // aux_dif += pow(q_dif[d], 2) * fe_values.JxW(q);
-                    // aux_pre += pow(q_pre[d], 2) * fe_values.JxW(q);
-                    aux_res += pow(q_time[d] + q_conv[d] - q_dif[d] + q_pre[d], 2) * fe_values.JxW(q);
-                }
-
-                res_time += aux_time;
-                res_conv += aux_conv;
-                res_dif += aux_dif;
-                res_pre += aux_pre;
-                res_eq += sqrt(aux_res);
-            }
-
-            cell_indexes[i] = cell->index();
-            estimated_error_per_cell[i] = res_eq / n_q_points;
-            componentes[i][0] = res_time / n_q_points;
-            componentes[i][1] = res_conv / n_q_points;
-            componentes[i][2] = res_dif / n_q_points;
-            componentes[i][3] = res_pre / n_q_points;
-            componentes[i][4] = estimated_error_per_cell[i];
-            // printf("%f ", estimated_error_per_cell[i]);
-            //  if (i % 10 == 0) {
-            //      printf("\n");
-            //  }
-            mesh_info[i] = "";
-            for (const auto ci : cell->vertex_indices()) {
-                Point<2> &p = cell->vertex(ci);
-                // std::cout << "teste 0: " << cell->vertex_dof_index(i, 0) << ", 1: " << cell->vertex_dof_index(i, 1) << std::endl;
-                // std::cout << "cell-id: " << cell->index() << ", vertex-ind:" << i << ", x: " << p[0] << ", y: " << p[1] << std::endl;
-
-                mesh_info[i] += std::to_string(ci)                                     // indice local do vertice
-                                + "|" + std::to_string(cell->vertex_dof_index(ci, 0))  // dof index x
-                                + "|" + std::to_string(cell->vertex_dof_index(ci, 1))  // dof index y
-                                + "|" + std::to_string(p[0])                           // posicao x
-                                + "|" + std::to_string(p[1])                           // posicao y
-                                + ":";                                                 // separador de vertices
-            }
-            // std::cout << "mesh_info -> " << mesh_info[i] << std::endl;
-
-            i++;
-        }
-        printf("\n");
-
-        float min = estimated_error_per_cell[0];
-        float max = estimated_error_per_cell[0];
-        for (i = 1; i < estimated_error_per_cell.size(); i++) {
-            if (estimated_error_per_cell[i] < min) {
-                min = estimated_error_per_cell[i];
-            }
-            if (estimated_error_per_cell[i] > max) {
-                max = estimated_error_per_cell[i];
-            }
-        }
-
-        printf("estimated_error_per_cell max=%f, min=%f\n", max, min);
-
-        // Cria arquivo de saida do residuo
-        std::string dir = "amrdata" + std::to_string(refinamento_inicial) + "_ordem" + std::to_string(degree);
-
-        if (!create_dir(dir)) {
-            printf("Erro ao criar diretorio\n");
-            exit(3);
-        }
-
-        std::ofstream resultado(dir + "/residuo_t" + std::to_string(timestep_number) + ".csv");
-
-        resultado << "cell_index,tempo,conveccao,difusao,pressao,residuo,mesh_info" << std::endl;
-        python_args = "";
-        for (int i = 0; i < cell_indexes.size(); i++) {
-            resultado << cell_indexes[i]
-                      << "," << componentes[i][0]
-                      << "," << componentes[i][1]
-                      << "," << componentes[i][2]
-                      << "," << componentes[i][3]
-                      << "," << componentes[i][4]
-                      << "," << mesh_info[i]
-                      << std::endl;
-            python_args += std::to_string(cell_indexes[i])            // indice da celula
-                           + "," + std::to_string(componentes[i][0])  // tempo
-                           + "," + std::to_string(componentes[i][1])  // convecção
-                           + "," + std::to_string(componentes[i][2])  // difusão
-                           + "," + std::to_string(componentes[i][3])  // pressão
-                           + "," + std::to_string(componentes[i][4])  // residuo
-                           + "|";                                     // separador
-        }
-
-        resultado.close();
-
-        // Escreve como svg a malha final
-        std::ofstream mesh_svg_file(dir + "/mesh_t" + std::to_string(timestep_number) + ".svg");
-        GridOutFlags::Svg svg_flags;
-        GridOut grid_out;
-
-        svg_flags.label_cell_index = true;
-        grid_out.set_flags(svg_flags);
-        grid_out.write_svg(triangulation, mesh_svg_file);
-    }
-
     std::string diretorio_amr() {
-        std::string dir = "amrdata" + std::to_string(refinamento_inicial) + "_ordem" + std::to_string(degree);
+        int reynolds_int = round(reynolds);
+        std::string dir = "amrdata" + std::to_string(refinamento_inicial);
+        dir += "_ordem" + std::to_string(degree);
+        dir += "_reynolds" + std::to_string(reynolds_int);
+
         if (!create_dir(dir)) {
             printf("Erro ao criar diretorio\n");
             exit(3);
@@ -744,25 +716,24 @@ class NavierStokesCG {
         return dir;
     }
 
-    void calcula_componentes_e_residuo(Vector<float> &estimated_error_per_cell) {
-        QGauss<dim> quadrature_formula(degree + 1);
-        FEValues<dim> fe_values(fe,
-                                quadrature_formula,
-                                update_values | update_gradients | update_hessians | update_quadrature_points | update_JxW_values);
+    /**
+     * Faz a estimativa de erro por gradiente (Kelly) ou resíduo
+     * @param estimated_error_per_cell Vetor de estimativas por ordem de chamada do iterator do deal.ii
+     * @param usar_kelly_estimator True para estimar erro por gradiente. False para estimar pelo resíduo
+     */
+    void calcula_funcao_s(Vector<float> &estimated_error_per_cell, bool usar_kelly_estimator) {
+        std::vector<Point<dim>> vel_points(1);
+        vel_points[0] = Point<dim>(0.0, 0.0);
+        Quadrature<dim> quadrature(vel_points);
+        FEValues<dim> fe_values(fe, quadrature, update_values | update_gradients | update_hessians);
+        // std::vector<Vector<double>> local_values(quadrature.size(), Vector<double>(dim + 1));
 
-        const unsigned int n_q_points = quadrature_formula.size();
+        const unsigned int n_q_points = quadrature.size();
 
-        if (n_q_points != 9) {
-            std::cout << "Só funciona com celulas 2D com aproximação Q2-Q2!" << std::endl;
-            exit(1);
-        }
+        const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
+        const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
 
-        // Testa componentes com elementos finitos
-        std::vector<types::global_dof_index> local_dof_indices(fe.n_dofs_per_cell());
-        Vector<double> local_dof_values(fe.n_dofs_per_cell());
-        Vector<double> local_dof_values_ant(fe.n_dofs_per_cell());
-
-        // posições na celula atual
+        // Dados na celula atual
         std::vector<Tensor<1, dim>> solution_ant_u_values(n_q_points);
         std::vector<Tensor<1, dim>> solution_atual_u_values(n_q_points);
         std::vector<Tensor<2, dim>> solution_atual_grad_u_values(n_q_points);
@@ -770,71 +741,67 @@ class NavierStokesCG {
         // std::vector<double> solution_atual_div_u_values(n_q_points);
         std::vector<Tensor<1, dim>> solution_atual_grad_p_values(n_q_points);
 
-        const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
-        const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
-
-        // Armazena as componentes
-        std::vector<double> componentes(8);
-
-        double residuo_x, residuo_y;
+        Tensor<1, dim> residuo;
+        Point<dim> p;
+        double norma_residuo;
         int indice_celula = 0;
-        int q = 8;  // Na celula 2d Q2-Q2 o ultimo ponto da quadratura é o do centro
 
         // Limpa o hashmap pra essa iteração
         cell_map.clear();
 
+        if (usar_kelly_estimator) {
+            KellyErrorEstimator<dim>::estimate(
+                dof_handler,
+                QGauss<dim - 1>(degree + 1),
+                std::map<types::boundary_id, const Function<dim> *>(),
+                solution,
+                estimated_error_per_cell,
+                fe.component_mask(velocities));
+        }
+
         // Abre o arquivo CSV de saída
+        // Esse arquivo é usado para debug e acompanhamento do refinamento
         std::string dir = diretorio_amr();
         std::ofstream arquivo_csv(dir + "/residuo_t" + std::to_string(timestep_number) + ".csv", std::ios::trunc);
-        arquivo_csv << "cell_index,ace_x,ace_y,con_x,con_y,dif_x,dif_y,pre_x,pre_y,res_x,res_y,pt_x,pt_y" << std::endl;
+        arquivo_csv << "cell_index,residuo,alpha_pe_ant,pt_x,pt_y" << std::endl;
 
         for (const auto &cell : dof_handler.active_cell_iterators()) {
             fe_values.reinit(cell);
+            if (usar_kelly_estimator == false) {
+                fe_values[velocities].get_function_values(prev_solution, solution_ant_u_values);
+                fe_values[velocities].get_function_values(solution, solution_atual_u_values);
+                fe_values[velocities].get_function_gradients(solution, solution_atual_grad_u_values);
+                fe_values[velocities].get_function_laplacians(solution, solution_atual_lap_u_values);
+                //  fe_values[velocities].get_function_divergences(solution, solution_atual_div_u_values);
+                fe_values[pressure].get_function_gradients(solution, solution_atual_grad_p_values);
 
-            // std::cout << "cell->id(): " << cell->id().to_string() << std::endl;
-            //  int cellId = cell->id().to_binary();
-
-            fe_values[velocities]
-                .get_function_values(prev_solution, solution_ant_u_values);
-            fe_values[velocities].get_function_values(solution, solution_atual_u_values);
-            fe_values[velocities].get_function_gradients(solution, solution_atual_grad_u_values);
-            fe_values[velocities].get_function_laplacians(solution, solution_atual_lap_u_values);
-            //  fe_values[velocities].get_function_divergences(solution, solution_atual_div_u_values);
-            fe_values[pressure].get_function_gradients(solution, solution_atual_grad_p_values);
-
-            // Supondo que a célula seja 2D e Q2-Q2, vai usar só o ponto da quadratura no centro da celula
-            for (unsigned int d = 0; d < dim; ++d) {
-                componentes[d] = rho * (solution_atual_u_values[q][d] - solution_ant_u_values[q][d]) / time_step;  // Termo no tempo
-                componentes[d + 2] = rho * (solution_atual_grad_u_values[q] * solution_atual_u_values[q])[d];      // Termo convectivo
-                componentes[d + 4] = visc * solution_atual_lap_u_values[q][d];                                     // Termo difusivo
-                componentes[d + 6] = solution_atual_grad_p_values[q][d];                                           // Termo da pressão
+                residuo = (rho * (solution_atual_u_values[0] - solution_ant_u_values[0]) / time_step  // Termo no tempo
+                           + rho * solution_atual_grad_u_values[0] * solution_atual_u_values[0]       // Termo convectivo
+                           - visc * solution_atual_lap_u_values[0]                                    // Termo difusivo
+                           + solution_atual_grad_p_values[0]                                          // Termo da pressão
+                );
             }
 
-            // calcula residuo
-            residuo_x = componentes[0] + componentes[2] - componentes[4] + componentes[6];
-            residuo_y = componentes[1] + componentes[3] - componentes[5] + componentes[7];
-
-            // Pra métrica de refinamento padrão, é retornado esse array com a magnitude do erro
-            estimated_error_per_cell[indice_celula] = sqrt(pow(residuo_x, 2) + pow(residuo_y, 2));
-
-            // ponto central da célula
-            Point<dim> p = cell->center();
+            // Cria um indice numérico mapeado ao indice unico (string) da célula retornado pelo deal.ii
             std::string cell_id = cell->id().to_string();
             cell_map.insert(std::make_pair(cell_id, indice_celula));
 
-            arquivo_csv << indice_celula          // cell_index
-                        << "," << componentes[0]  // ace_x
-                        << "," << componentes[1]  // ace_y
-                        << "," << componentes[2]  // con_x
-                        << "," << componentes[3]  // con_y
-                        << "," << componentes[4]  // dif_x
-                        << "," << componentes[5]  // dif_y
-                        << "," << componentes[6]  // pre_x
-                        << "," << componentes[7]  // pre_y
-                        << "," << residuo_x       // res_x
-                        << "," << residuo_y       // res_y
-                        << "," << p[0]            // pt_x
-                        << "," << p[1]            // pt_y
+            // Armazena a norma simples do resíduo por célula
+            if (usar_kelly_estimator == false) {
+                norma_residuo = residuo.norm();
+                estimated_error_per_cell[indice_celula] = norma_residuo;
+            } else {
+                // Sai aqui os valores do kelly estimator
+                norma_residuo = estimated_error_per_cell[indice_celula];
+            }
+
+            // Salva dados de debug e acompanhamento
+            p = cell->center();
+            arquivo_csv << indice_celula         // cell_index
+                        << "," << norma_residuo  // residuo
+                        << "," << alpha_pe       // alpha_pe_ant
+                        << "," << p[0]           // pt_x
+                        << "," << p[1]           // pt_y
                         << std::endl;
 
             indice_celula++;
@@ -844,195 +811,227 @@ class NavierStokesCG {
         arquivo_csv.close();
     }
 
-    void calcula_refinamento_python() {
-        // Comando a ser executado
-        std::string dir = diretorio_amr();
-        std::string cmd = "python3 refinamento.py " + dir + " " + std::to_string(timestep_number);
-        // std::cout << "cmd: " << cmd << std::endl;
-
-        // Executa o comando
-        std::shared_ptr<FILE> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (!pipe) {
-            std::cout << "Error: popen failed!" << std::endl;
-            exit(5);
+    /**
+     * Quicksort
+     * @param vector Vetor de floats
+     */
+    void quicksort(Vector<float> &vector, int inicio, int fim) {
+        if (inicio < fim) {
+            int p = particao(vector, inicio, fim);
+            quicksort(vector, inicio, p - 1);
+            quicksort(vector, p + 1, fim);
         }
+    };
 
-        // Leitura do stdout do python
-        char buffer[128];
-        std::string result = "";
-        while (!feof(pipe.get())) {
-            if (fgets(buffer, 128, pipe.get()) != nullptr) {
-                result += buffer;
+    /**
+     * Escolhe um pivo entre o inicio e o fim especificado, depois coloca todos os maiores que ele de um lado e
+     * todos os maiores do outro
+     * @param vet vetor à ser particionado
+     * @param inicio indice que começa a parte a ser particionada
+     * @param fim  indice que termina a parte a ser particionada
+     * @return a posição que o pivo ficou
+     */
+    int particao(Vector<float> &vector, int inicio, int fim) {
+        int i = inicio - 1;
+        float pivo = vector[fim];
+        float aux;
+
+        for (int j = inicio; j <= fim - 1; j++) {
+            if (vector[j] < pivo) {
+                i++;
+                aux = vector[i];
+                vector[i] = vector[j];
+                vector[j] = aux;
             }
         }
-        // std::cout << "resultado: " << result << "\n";
 
-        std::istringstream f(result.c_str());
-        std::string line;
-        std::istringstream sin;
-        std::istringstream sin2;
-        std::istringstream sin3;
+        aux = vector[i + 1];
+        vector[i + 1] = vector[fim];
+        vector[fim] = aux;
 
-        // Inicia vector onde o indice é o mesmo da célula
-        std::vector<int> flag_refinamento(triangulation.n_active_cells());
-        for (int i = 0; i < triangulation.n_active_cells(); i++) {
-            flag_refinamento[i] = 0;
-        }
+        return (i + 1);
+    };
 
-        // Interpreta stdout do python
-        int indice_celula;
-        int delta_celula;
-        bool erro = true;
-        while (std::getline(f, line)) {
-            sin.str(line.substr(line.find("=") + 1));
-            if (line.find("start") != std::string::npos) {
-                erro = false;
-            } else if (!erro && line.find("cell_index") != std::string::npos) {
-                std::string teste1;
-                sin >> teste1;
-                int sep = teste1.find(",");
-                sin2.str(teste1.substr(sep + 1));
-                sin2 >> delta_celula;
-                sin3.str(teste1.substr(0, sep));
-                sin3 >> indice_celula;
-                // std::cout << "teste1: " << teste1 << ", indice_celula: " << indice_celula << ", delta_celula: " << delta_celula << std::endl;
-                flag_refinamento[indice_celula] = delta_celula;
-            }
-            sin.clear();
-            sin2.clear();
-            sin3.clear();
-        }
-        if (erro) {
-            std::cout << "Ocorreu um erro ao tentar interpretar retorno do script python" << std::endl;
-            exit(1);
-        }
-
-        // Marca pra refinamento
+    /**
+     * Calcula o valor de threshold conforme o artigo 'Adaptive mesh refinement method. Part 1: Automatic
+     * thresholding based on a distribution function'
+     * @param estimated_error_per_cell Vetor de erro preenchido na ordem de chamada do iterator do deal.ii
+     */
+    bool calcula_refinamento_fd(Vector<float> estimated_error_per_cell) {
         int num_celulas_diminui_refinamento = 0;
         int num_celulas_aumenta_refinamento = 0;
-        for (const auto &cell : dof_handler.active_cell_iterators()) {
-            std::string cell_id = cell->id().to_string();
+        int num_celulas_nivel_limite = 0;
+        int num_celulas_travadas_por_loop = 0;
+        int j, k, n_sk, indice_celula;
+        double alpha, func, dist, cell_error;
+        double Sm = 0;
+        double aux = 0;
+        double beta = 2.0;
+        int num_celulas = estimated_error_per_cell.size();
+        double num_celulas_d = (double)num_celulas;
+        Vector<float> est_error_copy(num_celulas);
 
-            if (auto busca = cell_map.find(cell_id); busca != cell_map.end()) {
-                indice_celula = busca->second;
-            } else {
-                std::cout << "Celula '" << cell_id << "' não encontrada no mapeamento!\n";
-                exit(5);
+        // Calcula média do erro
+        for (j = 0; j < num_celulas; j++) {
+            Sm += estimated_error_per_cell[j];
+            // Aproveita e copia o vetor de erros
+            est_error_copy[j] = estimated_error_per_cell[j];
+        }
+        Sm = Sm / num_celulas_d;
+
+        printf("Sm = %f\n", Sm);
+
+        // Ordena a copia do vetor de erros
+        quicksort(est_error_copy, 0, num_celulas - 1);
+
+        alpha_pe = Sm;
+/*
+        // Calcula o threshold
+        for (j = 0; j < num_celulas; j++) {
+            alpha = Sm * pow(j / num_celulas_d, beta);
+            // printf("alpha = %f\n", alpha);
+            n_sk = 0;
+            for (k = 0; k < num_celulas; k++) {
+                if (estimated_error_per_cell[k] > alpha) {
+                    n_sk++;
+                }
             }
-
-            int delta = flag_refinamento[indice_celula];
-
-            if (delta > 0) {
-                cell->set_refine_flag();
-                num_celulas_aumenta_refinamento++;
-            } else if (delta < 0) {
-                cell->set_coarsen_flag();
-                num_celulas_diminui_refinamento++;
+            dist = n_sk / num_celulas_d;
+            func = alpha * dist;
+            if (func > aux) {
+                aux = func;
+                alpha_pe = alpha;
             }
         }
+*/
+        //double alpha_ce = alpha_pe / 4.0;
+        double alpha_ce = alpha_pe;
+        //int alpha_ind = round(num_celulas * 0.15);
+        //double alpha_ce = est_error_copy[alpha_ind];
 
-        printf("%d celulas aumentaram o refinamento e %d diminuiram o refinamento refinamento\n",
-               num_celulas_aumenta_refinamento,
-               num_celulas_diminui_refinamento);
-    }
+        printf("alpha_pe = %f\n", alpha_pe);
+        printf("alpha_ce = %f\n", alpha_ce);
 
-    void calcula_refinamento_limite(Vector<float> estimated_error_per_cell) {
-        int i = 0;
-        bool is_tam_minimo;
-        int num_celulas_diminui_refinamento = 0;
-        int num_celulas_aumenta_refinamento = 0;
-        float max_error = estimated_error_per_cell[0];
-        float min_error = estimated_error_per_cell[0];
+        alpha_pe_map.insert(std::make_pair(time, alpha_pe));
 
+        indice_celula = 0;
+        int direcao_mudanca;
+        int lim_loops = 3;  // Limite de loops até travamento da celula
+        bool celula_travada;
+        bool pode_travar = min_delta_entre_timesteps < 1e-4;
+
+        // Aplica refinamento dado o threshold calculado
         for (const auto &cell : dof_handler.active_cell_iterators()) {
-            if (estimated_error_per_cell[i] > max_error) {
-                max_error = estimated_error_per_cell[i];
+            cell_error = estimated_error_per_cell[indice_celula];
+            celula_travada = loops_nivel_map[indice_celula] > lim_loops;
+            direcao_mudanca = 0;
+
+            if (cell->level() < limite_nivel_refinamento && cell_error > alpha_pe) {
+                if (!pode_travar || !celula_travada) {
+                    cell->set_refine_flag();
+                    num_celulas_aumenta_refinamento++;
+                    direcao_mudanca = 1;
+                }
+            } else if (cell->level() > refinamento_inicial && cell_error < alpha_ce) {
+                if (!pode_travar || !celula_travada) {
+                    cell->set_coarsen_flag();
+                    num_celulas_diminui_refinamento++;
+                    direcao_mudanca = -1;
+                }
             }
-            if (estimated_error_per_cell[i] < min_error) {
-                min_error = estimated_error_per_cell[i];
+
+            if (pode_travar && !celula_travada && direcao_nivel_map[indice_celula] == direcao_mudanca) {
+                // Se tiver mudando na mesma direção, reseta o loop
+                direcao_nivel_map[indice_celula] = 0;
+                loops_nivel_map[indice_celula] = 0;
+            } else if (pode_travar && !celula_travada) {
+                // Se tiver mudando em direção diferente, registra no contador de loops
+                direcao_nivel_map[indice_celula] = direcao_mudanca;
+                loops_nivel_map[indice_celula] += 1;
             }
-            i++;
+
+            if (cell->level() >= limite_nivel_refinamento) {
+                num_celulas_nivel_limite++;
+            }
+            if (celula_travada) {
+                num_celulas_travadas_por_loop++;
+            }
+
+            indice_celula++;
         }
 
-        float threshold = ((max_error - min_error) * 0.3) + min_error;
-
-        printf("threshold: %f\n", threshold);
-
-        i = 0;
-        for (const auto &cell : dof_handler.active_cell_iterators()) {
-            is_tam_minimo = cell->measure() - min_area_cell < min_area_cell * 0.1;
-            if (is_tam_minimo == false && estimated_error_per_cell[i] > threshold) {
-                cell->set_refine_flag();
-                num_celulas_aumenta_refinamento++;
-            } else if (timestep_number > 3 && estimated_error_per_cell[i] < 0.01) {
-                cell->set_coarsen_flag();
-                num_celulas_diminui_refinamento++;
-            }
-            i++;
-        }
-
-        printf("%d celulas aumentaram o refinamento e %d diminuiram o refinamento refinamento. Maior erro: %f, Menor erro: %f\n",
+        printf("%d celulas aumentaram o refinamento, %d diminuiram o refinamento\n%d celulas chegaram no nivel limite (%d), %d celulas foram travadas por loop\n",
                num_celulas_aumenta_refinamento,
                num_celulas_diminui_refinamento,
-               max_error,
-               min_error);
+               num_celulas_nivel_limite,
+               limite_nivel_refinamento,
+               num_celulas_travadas_por_loop);
+
+        // exit(5);
+        return num_celulas_aumenta_refinamento > 0 || num_celulas_diminui_refinamento > 0;
     }
+
     /**
-     * Estratégia de refinamento 2D: Aplica o refinamento padrão, que dobra o número de células
-     * a cada passo de refinamento, mas impede que células abaixo de um tamanho mínimo sejam
-     * refinadas. Células a serem mescladas não são interrompidas
+     * Função linear que define de quantos em quantos passos de tempo o refinamento deve ser feito
+     * baseado na diferença entre a primeira solução da malha e a ultima antes de refinar pra próxima
      */
-    void calcula_refinamento_2D(Vector<float> estimated_error_per_cell) {
-        // Estratégia de refinamento padrão
-        double fracao_dividir = 0.3;
-        double fracao_mesclar = 0.03;
-        int num_celulas_ajustadas = 0;
+    int define_intervalo_entre_refinamentos() {
+        double delta_malha = erro_norma_L2(solution, ref_solution);
 
-        // Estratégia pronta do dealii
-        GridRefinement::refine_and_coarsen_fixed_number(triangulation,
-                                                        estimated_error_per_cell,
-                                                        fracao_dividir,   // Dividir células com maior erro
-                                                        fracao_mesclar,   // Mesclar células com menor erro
-                                                        limite_celulas);  // Número máximo de células na malha
-
-        // Desmarca refinamento de células com area menor que o limite
-        for (const auto &cell : dof_handler.active_cell_iterators()) {
-            if (cell->measure() - min_area_cell < min_area_cell * 0.1) {
-                cell->clear_refine_flag();
-                num_celulas_ajustadas++;
-            }
+        if (delta_malha > max_delta_malha) {
+            max_delta_malha = delta_malha;
         }
 
-        printf("%d celulas já chegaram no tamanho mínimo\n", num_celulas_ajustadas);
+        std::cout << "delta_malha: " << delta_malha << ", max_delta_malha: " << max_delta_malha << std::endl;
+
+        double a = (intervalo_malhas_max - intervalo_malhas_min) / max_delta_malha;
+        int intervalo = floor(a * (-delta_malha) + intervalo_malhas_max);
+
+        // Grava log do próximo intervalo
+        malha_int_map.insert(std::make_pair(time, intervalo));
+
+        // Grava log do delta da malha anterior
+        malha_dif_map.insert(std::make_pair(time, delta_malha));
+
+        return intervalo;
     }
 
+    /**
+     * Função que aplica o refinamento na malha
+     */
     void refine_grid() {
-        Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
-        std::string python_args;
-        const FEValuesExtractors::Vector velocity(0);
-
-        // KellyErrorEstimator<dim>::estimate(
-        //     dof_handler,
-        //     QGauss<dim - 1>(degree + 1),
-        //     std::map<types::boundary_id, const Function<dim> *>(),
-        //     solution,
-        //     estimated_error_per_cell,
-        //     fe.component_mask(velocity));
-
-        // Estima o erro pelo resíduo
-        calcula_componentes_e_residuo(estimated_error_per_cell);
-
+        bool is_debug = true;
         printf("\n*** Aplica Refinamento ***\n");
 
-        // Estratégia de refinamento por script python externo
-        // calcula_refinamento_python();
-        // exit(4);
-        // Estratégia de refinamento do deal.ii com limite de células
-        // calcula_refinamento_2D(estimated_error_per_cell);
+        Vector<float> estimated_error_per_cell(triangulation.n_active_cells());
+        std::string python_args;
+        const FEValuesExtractors::Vector velocities(0);
+
+        if (is_debug == false) {
+            // Usa o estimador de erro sem gerar arquivo CSV com a informação por célula
+            // Estimador de erro por gradiente proposto por Kelly et al. (info na documentação do deal.ii)
+            KellyErrorEstimator<dim>::estimate(
+                dof_handler,
+                QGauss<dim - 1>(degree + 1),
+                std::map<types::boundary_id, const Function<dim> *>(),
+                solution,
+                estimated_error_per_cell,
+                fe.component_mask(velocities));
+            printf("Usando estimador de erro sem gerar arquivo csv\n");
+        } else {
+            // Usa o estimador de erro gerando arquivo CSV com a informação por célula
+            // Segundo parâmetro: True pra estimar por gradiente (Kelly Estimator). False pra estimar pelo resíduo
+            calcula_funcao_s(estimated_error_per_cell, true);
+            printf("Usando estimador de erro gerando arquivo csv\n");
+        }
 
         // Estrategia de refinamento por limites
-        calcula_refinamento_limite(estimated_error_per_cell);
+        if (calcula_refinamento_fd(estimated_error_per_cell) == false) {
+            printf("*** Nenhuma celula pra aumentar ou diminuir o refinamento ***\n");
+            return;
+        }
 
+        // Aplica as flags de refinamento na malha
         triangulation.prepare_coarsening_and_refinement();
         SolutionTransfer<dim, BlockVector<double>> solution_transfer(dof_handler);
         solution_transfer.prepare_for_coarsening_and_refinement(solution);
@@ -1055,8 +1054,15 @@ class NavierStokesCG {
         // interpolated data.
         initialize_system();
         solution = tmp;
+        ref_solution = tmp;
+
+        printf("*** Refinamento foi aplicado ***\n");
     }
 
+    /**
+     * Cria um diretório no mesmo local onde o arquivo Stokes está sendo executado
+     * @param path Caminho relativo do diretório
+     */
     bool create_dir(std::string path) const {
         try {
             if (std::filesystem::is_directory(path) && std::filesystem::exists(path)) {  // Check if src folder exists
@@ -1070,21 +1076,29 @@ class NavierStokesCG {
         return true;
     }
 
+    /**
+     * Gera arquivo .vtu da solução atual
+     */
     void output_results() const {
+        int reynolds_int = round(reynolds);
         std::vector<std::string> solution_names(dim, "u");
         solution_names.emplace_back("p");
+
         std::vector<DataComponentInterpretation::DataComponentInterpretation>
-            interpretation(dim,
-                           DataComponentInterpretation::component_is_part_of_vector);
+            interpretation(dim, DataComponentInterpretation::component_is_part_of_vector);
+
         interpretation.push_back(DataComponentInterpretation::component_is_scalar);
         DataOut<dim> data_out;
         data_out.add_data_vector(dof_handler,
                                  solution,
                                  solution_names,
                                  interpretation);
+
         data_out.build_patches(degree + 1);
 
-        std::string dir = "solution" + std::to_string(refinamento_inicial) + "_ordem" + std::to_string(degree);
+        std::string dir = "solution" + std::to_string(refinamento_inicial);
+        dir += "_ordem" + std::to_string(degree);
+        dir += "_reynolds" + std::to_string(reynolds_int);
 
         if (create_dir(dir)) {
             std::ofstream output(dir + "/solution_t" + std::to_string(timestep_number) + ".vtu");
@@ -1094,23 +1108,98 @@ class NavierStokesCG {
         }
     }
 
-    void print_values() {
-        std::vector<Point<dim>> vel_points(1);
-        vel_points[0] = Point<dim>(0.0, 0.0);
-        Quadrature<dim> quadrature(vel_points);
-        FEValues<dim> fe_values(fe, quadrature, update_values | update_gradients);
-        std::vector<Vector<double>> local_values(quadrature.size(), Vector<double>(dim + 1));
+    /**
+     * Gera arquivos csv de linhas nos eixos x e y para comparação com os dados do artigo por Ghia
+     */
+    void gera_solucoes_eixos() {
+        int i;
+        int num_pontos = 1000;
+        double dx = (omega_fim - omega_init) / num_pontos;
+        double dy = dx;
 
-        for (const auto &cell : dof_handler.active_cell_iterators()) {
-            fe_values.reinit(cell);
-            fe_values.get_function_values(solution, local_values);
-            //            fe_values.get_function_gradients(solution_local, grad);
+        Point<dim> p_x;
+        Point<dim> p_y;
 
-            // uy na direção em y=0.5
-            if (cell->vertex(0)(1) == 0.5) {
-                printf("%f   %f \n", cell->vertex(0)(0), local_values[0](1));
-            }
+        p_x[0] = 0;
+        p_x[1] = 0.5;
+        p_y[0] = 0.5;
+        p_y[1] = 0;
+
+        int reynolds_int = round(reynolds);
+        std::string nome_base = "solution" + std::to_string(refinamento_inicial);
+        nome_base += "_ordem" + std::to_string(degree);
+        nome_base += "_reynolds" + std::to_string(reynolds_int);
+
+        std::ofstream arq_horizontal(nome_base + "_eixo_x.csv");
+        std::ofstream arq_vertical(nome_base + "_eixo_y.csv");
+
+        arq_horizontal << "ux,uy,p,x,y" << std::endl;
+        arq_vertical << "ux,uy,p,x,y" << std::endl;
+
+        for (i = 0; i <= num_pontos; i++) {
+            Vector<double> tmp_vector(dim + 1);
+
+            VectorTools::point_value(dof_handler, solution, p_x, tmp_vector);
+            arq_horizontal << tmp_vector[0]
+                           << "," << tmp_vector[1]
+                           << "," << tmp_vector[2]
+                           << "," << p_x[0]
+                           << "," << p_x[1]
+                           << std::endl;
+
+            VectorTools::point_value(dof_handler, solution, p_y, tmp_vector);
+            arq_vertical << tmp_vector[0]
+                         << "," << tmp_vector[1]
+                         << "," << tmp_vector[2]
+                         << "," << p_y[0]
+                         << "," << p_y[1]
+                         << std::endl;
+
+            p_x[0] += dx;
+            p_y[1] += dy;
         }
+
+        arq_horizontal.close();
+        arq_vertical.close();
+    }
+
+    void grava_estatisticas() {
+        std::string dir_stats = diretorio_stats();
+
+        std::ofstream arq_alpha_pe(dir_stats + "/alpha_pe.csv");
+        arq_alpha_pe << "time,alpha_pe" << std::endl;
+        for (const auto &[time, alpha_pe] : getHashMapAlphaPe()) {
+            arq_alpha_pe << time << "," << alpha_pe << std::endl;
+        }
+        arq_alpha_pe.close();
+
+        std::ofstream arq_malha_dif(dir_stats + "/malha_dif.csv");
+        arq_malha_dif << "time,malha_dif" << std::endl;
+        for (const auto &[time, malha_dif] : getHashMapMalhaDiff()) {
+            arq_malha_dif << time << "," << malha_dif << std::endl;
+        }
+        arq_malha_dif.close();
+
+        std::ofstream arq_malha_int(dir_stats + "/malha_int.csv");
+        arq_malha_int << "time,malha_int" << std::endl;
+        for (const auto &[time, malha_int] : getHashMapMalhaInt()) {
+            arq_malha_int << time << "," << malha_int << std::endl;
+        }
+        arq_malha_int.close();
+
+        std::ofstream arq_residuo(dir_stats + "/residuo.csv");
+        arq_residuo << "time,residuo" << std::endl;
+        for (const auto &[time, residuo] : getHashMapResiduo()) {
+            arq_residuo << time << "," << residuo << std::endl;
+        }
+        arq_residuo.close();
+
+        std::ofstream arq_num_celulas(dir_stats + "/num_celulas.csv");
+        arq_num_celulas << "time,num_celulas" << std::endl;
+        for (const auto &[time, num_celulas] : getHashMapNumCelulas()) {
+            arq_num_celulas << time << "," << num_celulas << std::endl;
+        }
+        arq_num_celulas.close();
     }
 };
 }  // namespace CGNS
@@ -1120,25 +1209,18 @@ int main(int argc, char *argv[]) {
     using namespace CGNS;
 
     const int dim = 2;     // 2D
-    const int degree = 2;  // Grau dos polinômios usados na aproximação
+    const int degree = 1;  // Grau dos polinômios usados na aproximação
+    degree_exec = degree;
 
     std::string arquivo_config = "config.txt";
-    std::string arquivo_saida = "saida.txt";
 
     if (argc < 2) {
         std::cout << "Nenhum arquivo de configuração fornecido. Usando " << arquivo_config << "\n";
-        std::cout << "Nenhum arquivo de saída fornecido. Usando " << arquivo_saida << "\n\n";
     } else if (argc == 2) {
         arquivo_config = argv[1];
         std::cout << "Arquivo de configuração a ser carregado: " << arquivo_config << "\n";
-        std::cout << "Nenhum arquivo de saída fornecido. Usando " << arquivo_saida << "\n\n";
-    } else if (argc == 3) {
-        arquivo_config = argv[1];
-        arquivo_saida = argv[2];
-        std::cout << "Arquivo de configuração a ser carregado: " << arquivo_config << "\n";
-        std::cout << "Arquivo de saída a ser gerado: " << arquivo_saida << "\n\n";
     } else {
-        std::cout << "Número de parametros fornecidos é inválido.\nEspera-se ./Stokes, ./Stokes config.txt ou ./Stokes config.txt saida.txt" << "\n\n";
+        std::cout << "Número de parametros fornecidos é inválido.\nEspera-se ./Stokes ou ./Stokes config.txt" << "\n\n";
         exit(3);
     }
 
@@ -1147,22 +1229,8 @@ int main(int argc, char *argv[]) {
     problem.lerConfiguracoes(arquivo_config);
     problem.run();
     auto end = std::chrono::steady_clock::now();
-
-    // Store the time difference between start and end
-    auto diff = end - start;
-
-    std::cout << "Tempo de execucao: " << std::chrono::duration<double, std::milli>(diff).count() / 1000 << " s" << std::endl;
-
-    // Cria arquivo de conclusão
-    std::ofstream resultado(arquivo_saida);
-
-    resultado << "Arquivo de configuração usado: " << arquivo_config << std::endl;
-    resultado << "Tempo de execucao: " << std::chrono::duration<double, std::milli>(diff).count() / 1000 << " s" << std::endl;
-    resultado << "Numero de células final: " << problem.getNumCells() << std::endl;
-    resultado << "Numero de passos de tempo feitos: " << problem.getPassosTempoSimulado() << std::endl;
-    resultado << "Tempo no ultimo passo: " << problem.getTempoSimulado() << "s" << std::endl;
-
-    resultado.close();
+    const std::chrono::duration<double> diff = end - start;
+    problem.gera_arquivo_saida(diff.count());
 
     return 0;
 }

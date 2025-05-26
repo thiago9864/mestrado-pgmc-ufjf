@@ -1,0 +1,11 @@
+visc = 0.001
+rho = 1.0
+u_max = 1.5
+time_end = 5.0
+time_step = 0.1
+delta_aprox_estatico = 1e-7
+refinamento_inicial = 2
+is_aprox_estacionario = 0
+limite_nivel_refinamento = 2
+intervalo_malhas_min = 5
+intervalo_malhas_max = 50

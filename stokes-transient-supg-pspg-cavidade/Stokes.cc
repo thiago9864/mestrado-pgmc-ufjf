@@ -37,13 +37,23 @@ namespace CGNS {
 using namespace dealii;
 
 // Parâmetros do problema
-double visc = 0.0025;
-double rho = 1.0;
-double time_end = 10.0;
-double omega_init = 0.0;
-double omega_fim = 1.0;
+// double visc = 0.0025;
+// double rho = 1.0;
+// double time_end = 10.0;
+// double omega_init = 0.0;
+// double omega_fim = 1.0;
+// double time_step;
 
+double visc;
+double rho;
+double time_end;
+double omega_init;
+double omega_fim;
+double delta_aprox_estatico;
 unsigned int time_max_number;
+bool is_aprox_estacionario;
+double time_step;
+int refinamento_inicial;
 
 /*
  * Classe que contém a representação da função do lado direito da equação de Stokes
@@ -100,14 +110,16 @@ class NavierStokesCG {
      * @i Grau de refinamento da malha -> 2^i elementos
      * @convergence_table Tabela de convergência
      */
-    void run(int i) {
+    void run() {
         int num_it;
         double delta;
+        int passo_output = 0;
 
         // Inicializa malha
-        make_grid_and_dofs(i);
+        make_grid_and_dofs();
 
         // Gera solução pro passo 0
+        reynolds = 1.0 / visc;
         time = 0.0;
         timestep_number = 0;
         inicia_condicao_contorno();
@@ -115,18 +127,19 @@ class NavierStokesCG {
         // constraints.distribute(solution);
         old_solution = prev_solution;
         solution = prev_solution;
-        output_results(i);
+        output_results();
 
         // Define o tamanho do passo de tempo proporcional ao valor de h
         time_step = 0.1;
         time_max_number = round(time_end / time_step);
+        
 
         printf("Usando o delta t=%f\n", time_step);
         printf("Num de Reynolds=%f\n", 1.0 / visc);
         printf("Execução em %d passos de tempo\n", time_max_number);
 
         // Incluir aqui mais um loop pro tempo (etapa 3)
-        for (timestep_number = 1; condicao_de_parada(true); timestep_number++) {
+        for (timestep_number = 1; condicao_de_parada(is_aprox_estacionario); timestep_number++) {
             time += time_step;
             num_it = 0;
 
@@ -168,8 +181,78 @@ class NavierStokesCG {
                    time,
                    num_it);
 
-            output_results(i);
+            // Acrescenta um intervalo no salvamento das soluções de forma que
+            // um delta t pequeno não gere muitas soluções
+            int multPassos = std::round(0.1 / time_step);
+            if (multPassos < 1) {
+                multPassos = 1;
+            }
+            if (passo_output >= multPassos - 1) {
+                // Salva solução no passo de tempo
+                output_results();
+                passo_output = 0;
+            } else {
+                passo_output++;
+            }
         }
+
+        gera_solucoes_eixos();
+    }
+
+    int getNumCells() {
+        return triangulation.n_active_cells();
+    }
+
+    double getTempoSimulado() {
+        return time;
+    }
+
+    double getPassosTempoSimulado() {
+        return timestep_number;
+    }
+
+    void lerConfiguracoes(std::string arquivo_config) {
+        std::string ipName;
+        std::ifstream fin(arquivo_config);
+        std::string line;
+        std::istringstream sin;
+
+        while (std::getline(fin, line)) {
+            sin.str(line.substr(line.find("=") + 1));
+            if (line.find("visc") != std::string::npos) {
+                sin >> visc;
+            } else if (line.find("rho") != std::string::npos) {
+                sin >> rho;
+            } else if (line.find("time_end") != std::string::npos) {
+                sin >> time_end;
+            } else if (line.find("omega_init") != std::string::npos) {
+                sin >> omega_init;
+            } else if (line.find("omega_fim") != std::string::npos) {
+                sin >> omega_fim;
+            } else if (line.find("delta_aprox_estatico") != std::string::npos) {
+                // std::cout << "delta_aprox_estatico " << sin.str() << ", " << atof(sin.str().c_str()) << std::endl;
+                sin >> delta_aprox_estatico;
+            } else if (line.find("time_step") != std::string::npos) {
+                sin >> time_step;
+            } else if (line.find("is_aprox_estacionario") != std::string::npos) {
+                sin >> is_aprox_estacionario;
+            } else if (line.find("refinamento_inicial") != std::string::npos) {
+                sin >> refinamento_inicial;
+            }
+            sin.clear();
+        }
+        printf("Executando o problema com as seguintes configurações\n");
+        printf("visc = %f\n", visc);
+        printf("rho = %f\n", rho);
+        printf("time_end = %f\n", time_end);
+        printf("omega_init = %f\n", omega_init);
+        printf("omega_fim = %f\n", omega_fim);
+        printf("delta_aprox_estatico = %.3e\n", delta_aprox_estatico);
+        printf("time_step = %f\n", time_step);
+        printf("is_aprox_estacionario = %B\n", is_aprox_estacionario);
+        printf("refinamento_inicial = %d\n", refinamento_inicial);
+
+        // exit(2);
     }
 
    private:
@@ -184,9 +267,10 @@ class NavierStokesCG {
     BlockVector<double> old_solution;
     BlockVector<double> system_rhs;
     AffineConstraints<double> constraints;
-    double time_step;
     double time;
     unsigned int timestep_number;
+    unsigned int time_max_number;
+    double reynolds = 0;
 
     /**
      * Condição de parada do for do tempo
@@ -196,8 +280,8 @@ class NavierStokesCG {
     bool condicao_de_parada(bool is_aprox_estacionario) {
         if (is_aprox_estacionario) {
             double delta = erro_norma_L2(solution, prev_solution);
-            //printf("Timestep: %d, Delta: %f\n", timestep_number, delta);
-            return timestep_number <= 2 || delta > 10e-6;
+            // printf("Timestep: %d, Delta: %f\n", timestep_number, delta);
+            return timestep_number <= 2 || delta > delta_aprox_estatico;
         } else {
             return timestep_number <= time_max_number;
         }
@@ -248,10 +332,10 @@ class NavierStokesCG {
     /**
      * Inicializa a malha e inclui os pontos locais e globais de cada nó
      */
-    void make_grid_and_dofs(int i) {
+    void make_grid_and_dofs() {
         // Aqui define o tamanho do domínio, nessa função hyper_cube
         GridGenerator::hyper_cube(triangulation, omega_init, omega_fim);
-        triangulation.refine_global(i);
+        triangulation.refine_global(refinamento_inicial);
         dof_handler.distribute_dofs(fe);
 
         std::vector<unsigned int> block_component(dim + 1, 0);
@@ -324,27 +408,28 @@ class NavierStokesCG {
         const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
 
         const double rho_dt = rho / time_step;
+        const double u_norm = old_solution.l2_norm();
+        double h;
+        double tau_u;
+        Tensor<2, dim> grad_phi_i_v;
+        Tensor<1, dim> phi_i_v;
+        double div_phi_i_v;
 
         for (const auto &cell : dof_handler.active_cell_iterators()) {
             fe_values.reinit(cell);
             local_matrix = 0;
             local_rhs = 0;
-            // right_hand_side.vector_value_list(fe_values.get_quadrature_points(),
-            //                                   rhs_values);
 
             fe_values[velocities].get_function_values(old_solution, old_solution_values);
             fe_values[velocities].get_function_values(prev_solution, prev_solution_values);
 
             // tau
-            const double u_norm = old_solution.l2_norm();
-
-            double h;
             if (dim == 2)
                 h = std::sqrt(4. * cell->measure() / M_PI) / degree;
             else if (dim == 3)
                 h = std::pow(6. * cell->measure() / M_PI, 1. / 3.) / degree;
 
-            const double tau_u = pow(pow(1.0 / time_step, 2) + pow((2.0 * u_norm) / h, 2) + ((4.0 * visc) / (3.0 * h)), -0.5);
+            tau_u = pow(pow(1.0 / time_step, 2) + pow((2.0 * u_norm) / h, 2) + ((4.0 * visc) / (3.0 * h)), -0.5);
 
             for (unsigned int q = 0; q < n_q_points; ++q) {
                 for (unsigned int i = 0; i < dofs_per_cell; ++i) {
@@ -357,9 +442,9 @@ class NavierStokesCG {
                     }
 
                     // 1ª equação phi_i_v
-                    const Tensor<2, dim> grad_phi_i_v = fe_values[velocities].gradient(i, q);  // grad_v
-                    const Tensor<1, dim> phi_i_v = fe_values[velocities].value(i, q);          // v
-                    const double div_phi_i_v = fe_values[velocities].divergence(i, q);         // div_v
+                    grad_phi_i_v = fe_values[velocities].gradient(i, q);   // grad_v
+                    phi_i_v = fe_values[velocities].value(i, q);           // v
+                    div_phi_i_v = fe_values[velocities].divergence(i, q);  // div_v
 
                     // 2ª equação
                     const double phi_i_q = fe_values[pressure].value(i, q);                  // q
@@ -419,6 +504,10 @@ class NavierStokesCG {
         constraints.distribute(solution);
     }
 
+    /**
+     * Cria um diretório no mesmo local onde o arquivo Stokes está sendo executado
+     * @param path Caminho relativo do diretório
+     */
     bool create_dir(std::string path) const {
         try {
             if (std::filesystem::is_directory(path) && std::filesystem::exists(path)) {  // Check if src folder exists
@@ -432,7 +521,11 @@ class NavierStokesCG {
         return true;
     }
 
-    void output_results(int i) const {
+    /**
+     * Gera arquivo .vtu da solução atual
+     */
+    void output_results() const {
+        int reynolds_int = round(reynolds);
         std::vector<std::string> solution_names(dim, "u");
         solution_names.emplace_back("p");
         std::vector<DataComponentInterpretation::DataComponentInterpretation>
@@ -446,7 +539,9 @@ class NavierStokesCG {
                                  interpretation);
         data_out.build_patches(degree + 1);
 
-        std::string dir = "solution" + std::to_string(i);
+        std::string dir = "solution" + std::to_string(refinamento_inicial);
+        dir += "_ordem" + std::to_string(degree);
+        dir += "_reynolds" + std::to_string(reynolds_int);
 
         if (create_dir(dir)) {
             std::ofstream output(dir + "/solution_t" + std::to_string(timestep_number) + ".vtu");
@@ -455,17 +550,112 @@ class NavierStokesCG {
             printf("Erro ao criar diretorio\n");
         }
     }
+
+    /**
+     * Gera arquivos csv de linhas nos eixos x e y para comparação com os dados do artigo por Ghia
+     */
+    void gera_solucoes_eixos() {
+        int i;
+        int num_pontos = 1000;
+        double dx = (omega_fim - omega_init) / num_pontos;
+        double dy = dx;
+
+        Point<dim> p_x;
+        Point<dim> p_y;
+
+        p_x[0] = 0;
+        p_x[1] = 0.5;
+        p_y[0] = 0.5;
+        p_y[1] = 0;
+
+        int reynolds_int = round(reynolds);
+        std::string nome_base = "solution" + std::to_string(refinamento_inicial);
+        nome_base += "_ordem" + std::to_string(degree);
+        nome_base += "_reynolds" + std::to_string(reynolds_int);
+
+        std::ofstream arq_horizontal(nome_base + "_eixo_x.csv");
+        std::ofstream arq_vertical(nome_base + "_eixo_y.csv");
+
+        arq_horizontal << "ux,uy,p,x,y" << std::endl;
+        arq_vertical << "ux,uy,p,x,y" << std::endl;
+
+        for (i = 0; i <= num_pontos; i++) {
+            Vector<double> tmp_vector(dim + 1);
+
+            VectorTools::point_value(dof_handler, solution, p_x, tmp_vector);
+            arq_horizontal << tmp_vector[0]
+                           << "," << tmp_vector[1]
+                           << "," << tmp_vector[2]
+                           << "," << p_x[0]
+                           << "," << p_x[1]
+                           << std::endl;
+
+            VectorTools::point_value(dof_handler, solution, p_y, tmp_vector);
+            arq_vertical << tmp_vector[0]
+                         << "," << tmp_vector[1]
+                         << "," << tmp_vector[2]
+                         << "," << p_y[0]
+                         << "," << p_y[1]
+                         << std::endl;
+
+            p_x[0] += dx;
+            p_y[1] += dy;
+        }
+
+        arq_horizontal.close();
+        arq_vertical.close();
+    }
 };
 }  // namespace CGNS
-int main() {
+
+int main(int argc, char *argv[]) {
     using namespace dealii;
     using namespace CGNS;
 
-    const int dim = 2;
-    const int i = 3;
+    const int dim = 2;     // 2D
+    const int degree = 3;  // Usando polinomios de ordem 1
 
-    NavierStokesCG<dim> problem(1);
-    problem.run(i);
+    std::string arquivo_config = "config.txt";
+    std::string arquivo_saida = "saida.txt";
+
+    if (argc < 2) {
+        std::cout << "Nenhum arquivo de configuração fornecido. Usando " << arquivo_config << "\n";
+        std::cout << "Nenhum arquivo de saída fornecido. Usando " << arquivo_saida << "\n\n";
+    } else if (argc == 2) {
+        arquivo_config = argv[1];
+        std::cout << "Arquivo de configuração a ser carregado: " << arquivo_config << "\n";
+        std::cout << "Nenhum arquivo de saída fornecido. Usando " << arquivo_saida << "\n\n";
+    } else if (argc == 3) {
+        arquivo_config = argv[1];
+        arquivo_saida = argv[2];
+        std::cout << "Arquivo de configuração a ser carregado: " << arquivo_config << "\n";
+        std::cout << "Arquivo de saída a ser gerado: " << arquivo_saida << "\n\n";
+    } else {
+        std::cout << "Número de parametros fornecidos é inválido.\nEspera-se ./Stokes, ./Stokes config.txt ou ./Stokes config.txt saida.txt" << "\n\n";
+        exit(3);
+    }
+
+    auto start = std::chrono::steady_clock::now();
+    NavierStokesCG<dim> problem(degree);
+    problem.lerConfiguracoes(arquivo_config);
+    problem.run();
+    auto end = std::chrono::steady_clock::now();
+
+    // Store the time difference between start and end
+    auto diff = end - start;
+
+    std::cout << "Tempo de execucao: " << std::chrono::duration<double, std::milli>(diff).count() / 1000 << " s" << std::endl;
+
+    // Cria arquivo de conclusão
+    std::ofstream resultado(arquivo_saida);
+
+    resultado << "Arquivo de configuração usado: " << arquivo_config << std::endl;
+    resultado << "Tempo de execucao: " << std::chrono::duration<double, std::milli>(diff).count() / 1000 << " s" << std::endl;
+    resultado << "Numero de células final: " << problem.getNumCells() << std::endl;
+    resultado << "Numero de passos de tempo feitos: " << problem.getPassosTempoSimulado() << std::endl;
+    resultado << "Tempo no ultimo passo: " << problem.getTempoSimulado() << "s" << std::endl;
+
+    resultado.close();
 
     return 0;
 }

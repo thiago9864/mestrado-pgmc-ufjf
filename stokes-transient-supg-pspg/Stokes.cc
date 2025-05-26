@@ -161,6 +161,8 @@ class NavierStokesCG {
                 }
             } while (delta > 1e-6);
 
+            get_solution_components_v2();
+
             // Armazena solução em u^{n}
             prev_solution.block(0) = solution.block(0);
 
@@ -230,6 +232,317 @@ class NavierStokesCG {
         return sqrt(erroL2);
     }
 
+    void write_dof_locations(const DoFHandler<2> &dof_handler, const std::string &filename) {
+        const std::map<types::global_dof_index, Point<2>> dof_location_map =
+            DoFTools::map_dofs_to_support_points(MappingQ1<2>(), dof_handler);
+
+        std::ofstream dof_location_file(filename);
+        DoFTools::write_gnuplot_dof_support_point_info(dof_location_file,
+                                                       dof_location_map);
+    }
+
+    void get_solution_components_v2() {
+        QGauss<dim> quadrature_formula(degree + 1);
+        FEValues<dim> fe_values(fe,
+                                quadrature_formula,
+                                update_values | update_gradients | update_hessians | update_quadrature_points | update_JxW_values);
+
+        const unsigned int n_q_points = quadrature_formula.size();
+
+        if (n_q_points != 9) {
+            std::cout << "Só funciona com celulas 2D e Q2-Q2!" << std::endl;
+            exit(1);
+        }
+
+        write_dof_locations(dof_handler, "dof-locations-1.gnuplot");
+
+        // Testa componentes com elementos finitos
+        std::vector<types::global_dof_index> local_dof_indices(fe.n_dofs_per_cell());
+        Vector<double> local_dof_values(fe.n_dofs_per_cell());
+        Vector<double> local_dof_values_ant(fe.n_dofs_per_cell());
+
+        // posições na celula atual
+        std::vector<Tensor<1, dim>> solution_ant_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_u_values(n_q_points);
+        std::vector<Tensor<2, dim>> solution_atual_grad_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_lap_u_values(n_q_points);
+        // std::vector<double> solution_atual_div_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_grad_p_values(n_q_points);
+
+        const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
+        const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
+
+        // Armazena as componentes
+        std::vector<double> componentes(8);
+        std::vector<double> componentes2(8);
+
+        double residuo_x, residuo_y;
+        int q = 8;
+
+        for (const auto &cell : dof_handler.active_cell_iterators()) {
+            fe_values.reinit(cell);
+
+            double hx = (cell->vertex(1)[0] - cell->vertex(0)[0]) / 2.0;
+            double hy = (cell->vertex(2)[1] - cell->vertex(0)[1]) / 2.0;
+
+            fe_values[velocities]
+                .get_function_values(prev_solution, solution_ant_u_values);
+            fe_values[velocities].get_function_values(solution, solution_atual_u_values);
+            fe_values[velocities].get_function_gradients(solution, solution_atual_grad_u_values);
+            fe_values[velocities].get_function_laplacians(solution, solution_atual_lap_u_values);
+            //  fe_values[velocities].get_function_divergences(solution, solution_atual_div_u_values);
+            fe_values[pressure].get_function_gradients(solution, solution_atual_grad_p_values);
+
+            // Supondo que a célula seja 2D e Q2-Q2, vai usar só o ponto da quadratura no centro da celula
+            for (unsigned int d = 0; d < dim; ++d) {
+                componentes[d] = rho * (solution_atual_u_values[q][d] - solution_ant_u_values[q][d]) / time_step;  // Termo no tempo
+                componentes[d + 2] = rho * (solution_atual_grad_u_values[q] * solution_atual_u_values[q])[d];      // Termo convectivo
+                componentes[d + 4] = visc * solution_atual_lap_u_values[q][d];                                     // Termo difusivo
+                componentes[d + 6] = solution_atual_grad_p_values[q][d];                                           // Termo da pressão
+            }
+
+            // calcula residuo
+            residuo_x = componentes[0] + componentes[2] - componentes[4] + componentes[6];
+            residuo_y = componentes[1] + componentes[3] - componentes[5] + componentes[7];
+
+            // Calcula solução exata no ponto do meio da célula
+            ExactSolution<dim> solution_function;
+            // Point<dim> p = cell->center();
+            Point<dim> p = cell->vertex(q);
+
+            if (q == 4) {
+                p[0] = cell->vertex(0)[0];
+                p[1] = cell->vertex(0)[1] + hy;
+            } else if (q == 5) {
+                p[0] = cell->vertex(1)[0];
+                p[1] = cell->vertex(1)[1] + hy;
+            } else if (q == 6) {
+                p[0] = cell->vertex(0)[0] + hx;
+                p[1] = cell->vertex(0)[1];
+            } else if (q == 7) {
+                p[0] = cell->vertex(2)[0] + hx;
+                p[1] = cell->vertex(2)[1];
+            } else if (q == 8) {
+                p[0] = cell->vertex(0)[0] + hx;
+                p[1] = cell->vertex(0)[1] + hy;
+            }
+
+            Vector<double> values(dim + 1);
+            solution_function.set_time(time);
+            solution_function.vector_value(p, values);
+
+            // Extrai solução do mesmo ponto no meio da célula
+            Vector<double> tmp_vector(dim + 1);
+            VectorTools::point_value(dof_handler, solution, p, tmp_vector);
+
+            double residuo_mag = sqrt(pow(residuo_x, 2) + pow(residuo_y, 2));
+            double dif_mag = sqrt(pow(values[0] - tmp_vector[0], 2) + pow(values[1] - tmp_vector[1], 2));
+
+            std::cout << "---- celula " << cell->index() << "----" << std::endl;
+            std::cout << "cx: " << cell->center()[0] << ", cy: " << cell->center()[1] << std::endl;
+            std::cout << "cx: " << p[0] << ", cy: " << p[1] << std::endl;
+            std::cout << "n_q_points: " << n_q_points << std::endl;
+            std::cout << "residuo_x: " << residuo_x << ", residuo_y: " << residuo_y << ", magnitude: " << residuo_mag << std::endl;
+            std::cout << "sol_exata_x: " << values[0] << ", sol_exata_y: " << values[1] << std::endl;
+            std::cout << "sol_x: " << tmp_vector[0] << ", sol_y: " << tmp_vector[1] << std::endl;
+            std::cout << "dif_x: " << std::abs(values[0] - tmp_vector[0]) << ", dif_y: " << std::abs(values[1] - tmp_vector[1]) << ", magnitude: " << dif_mag << std::endl;
+            std::cout << "componentes" << std::endl;
+
+            for (int k = 0; k < componentes.size(); k++) {
+                std::cout << "componentes[" << k << "]: " << componentes[k] << "| componentes2[" << k << "]: " << componentes2[k] << std::endl;
+            }
+
+            std::cout << std::endl;
+        }
+
+        exit(5);
+    }
+
+    void get_solution_components() {
+        std::vector<std::vector<double>> componentes(
+            triangulation.n_active_cells(),
+            std::vector<double>(dim * 5, 0.0));
+
+        std::vector<double> componentes2(8);
+
+        QGauss<dim> quadrature_formula(degree + 1);
+        // QGauss<dim - 1> face_quadrature_formula(degree + 1);
+        FEValues<dim> fe_values(fe,
+                                quadrature_formula,
+                                update_values | update_gradients | update_hessians |
+                                    update_quadrature_points | update_JxW_values);
+
+        const unsigned int n_q_points = quadrature_formula.size();
+
+        //////////////////
+        // https://www.dealii.org/current/doxygen/deal.II/classFiniteElement.html
+        ////////////////////
+
+        // posições na celula atual
+        std::vector<Tensor<1, dim>> solution_ant_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_u_values(n_q_points);
+        std::vector<Tensor<2, dim>> solution_atual_grad_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_lap_u_values(n_q_points);
+        // std::vector<double> solution_atual_div_u_values(n_q_points);
+        std::vector<Tensor<1, dim>> solution_atual_grad_p_values(n_q_points);
+
+        const FEValuesExtractors::Vector velocities(0);  //(x,y,?)
+        const FEValuesExtractors::Scalar pressure(dim);  //(?,?,p)
+
+        Tensor<1, dim> q_time;
+        Tensor<1, dim> q_conv;
+        Tensor<1, dim> q_dif;
+        Tensor<1, dim> q_pre;
+
+        double aux_time, aux_conv, aux_dif, aux_pre, aux_px, aux_py;
+        double residuo_x, residuo_y;
+        double residuo2_x, residuo2_y;
+        int vertex_count, i;
+
+        std::vector<types::global_dof_index> local_dof_indices(fe.n_dofs_per_cell());
+        Vector<double> local_dof_values(fe.n_dofs_per_cell());
+        Vector<double> local_dof_values_ant(fe.n_dofs_per_cell());
+
+        for (const auto &cell : dof_handler.active_cell_iterators()) {
+            fe_values.reinit(cell);
+
+            cell->get_dof_indices(local_dof_indices);
+
+            std::cout << "\nlocal_dof_indices: " << local_dof_indices.size() << std::endl;
+            std::cout << "n_dofs_per_cell: " << fe.n_dofs_per_cell() << std::endl;
+            std::cout << "GeometryInfo<dim>::vertices_per_cell: " << GeometryInfo<dim>::vertices_per_cell << std::endl;
+            std::cout << "n_q_points: " << n_q_points << std::endl;
+
+            double hx = (cell->vertex(1)[0] - cell->vertex(0)[0]) / 2.0;
+            double hy = (cell->vertex(2)[1] - cell->vertex(0)[1]) / 2.0;
+
+            std::cout << "cell diameter x: " << 2 * hx << std::endl;
+            std::cout << "cell diameter y: " << 2 * hy << std::endl;
+
+            cell->get_dof_values(solution, local_dof_values);
+            cell->get_dof_values(prev_solution, local_dof_values_ant);
+
+            // for (int k = 0; k < local_dof_values.size(); k++) {
+            //     std::cout << "local_dof_value[" << k << "]: " << local_dof_values[k] << std::endl;
+            // }
+            // std::cout << std::endl;
+
+            // exit(6);
+
+            get_df_solution_components(
+                local_dof_values,
+                local_dof_values_ant,
+                hx,
+                hy,
+                componentes2);
+
+            fe_values[velocities]
+                .get_function_values(prev_solution, solution_ant_u_values);
+            fe_values[velocities].get_function_values(solution, solution_atual_u_values);
+            fe_values[velocities].get_function_gradients(solution, solution_atual_grad_u_values);
+            fe_values[velocities].get_function_laplacians(solution, solution_atual_lap_u_values);
+            //  fe_values[velocities].get_function_divergences(solution, solution_atual_div_u_values);
+            fe_values[pressure].get_function_gradients(solution, solution_atual_grad_p_values);
+
+            for (unsigned int d = 0; d < dim; ++d) {
+                aux_time = 0.0;
+                aux_conv = 0.0;
+                aux_dif = 0.0;
+                aux_pre = 0.0;
+
+                std::cout << "\ndim " << d << " celula " << i << std::endl;
+
+                for (unsigned int q = 0; q < n_q_points; ++q) {
+                    q_time = rho * (solution_atual_u_values[q] - solution_ant_u_values[q]) / time_step;  // Termo no tempo
+                    q_conv = rho * solution_atual_grad_u_values[q] * solution_atual_u_values[q];         // Termo convectivo
+                    q_dif = visc * solution_atual_lap_u_values[q];                                       // Termo difusivo
+                    q_pre = solution_atual_grad_p_values[q];                                             // Termo da pressão
+
+                    aux_time += q_time[d];
+                    aux_conv += q_conv[d];
+                    aux_dif += q_dif[d];
+                    aux_pre += q_pre[d];
+
+                    std::cout << "\nq_time[" << q << "][" << d << "]: " << q_time[d] << std::endl;
+                    std::cout << "df_time[" << d << "]: " << q_time[d] << std::endl;
+
+                    std::cout << "q_conv[" << q << "][" << d << "]: " << q_conv[d] << std::endl;
+                    std::cout << "df_conv[" << d << "]: " << q_conv[d + 2] << std::endl;
+
+                    std::cout << "q_dif[" << q << "][" << d << "]: " << q_dif[d] << std::endl;
+                    std::cout << "df_dif[" << d << "]: " << q_dif[d + 4] << std::endl;
+
+                    std::cout << "q_pre[" << q << "][" << d << "]: " << q_pre[d] << std::endl;
+                    std::cout << "df_pre[" << d << "]: " << q_pre[d + 6] << std::endl;
+
+                    // aux_time += pow(q_time[d], 2) * fe_values.JxW(q);
+                    // aux_conv += pow(q_conv[d], 2) * fe_values.JxW(q);
+                    // aux_dif += pow(q_dif[d], 2) * fe_values.JxW(q);
+                    // aux_pre += pow(q_pre[d], 2) * fe_values.JxW(q);
+                }
+
+                // Preenche com o ponto do meio da célula
+                componentes[cell->index()][d] = aux_time / n_q_points;
+                componentes[cell->index()][d + 2] = aux_conv / n_q_points;
+                componentes[cell->index()][d + 4] = aux_dif / n_q_points;
+                componentes[cell->index()][d + 6] = aux_pre / n_q_points;
+            }
+
+            aux_px = 0.0;
+            aux_py = 0.0;
+            vertex_count = 0;
+            for (const auto ci : cell->vertex_indices()) {
+                Point<2> &p = cell->vertex(ci);
+                aux_px += p[0];
+                aux_py += p[1];
+                vertex_count++;
+            }
+            componentes[cell->index()][8] = aux_px / vertex_count;
+            componentes[cell->index()][9] = aux_py / vertex_count;
+            // d=0 -> 0,2,4,6 | d=1 -> 1,3,5,7
+            // componentes = [ [cx0,cy0,cx1,cy1,cx2,cy2,cx3,cy3,px4,px4] ]
+
+            ExactSolution<dim> solution_function;
+            Point<dim> p;
+            Vector<double> values(dim + 1);
+            p[0] = componentes[cell->index()][8];
+            p[1] = componentes[cell->index()][9];
+            solution_function.set_time(time);
+            solution_function.vector_value(p, values);
+
+            residuo_x = componentes[cell->index()][0] + componentes[cell->index()][2] - componentes[cell->index()][4] + componentes[cell->index()][6];
+            residuo_y = componentes[cell->index()][1] + componentes[cell->index()][3] - componentes[cell->index()][5] + componentes[cell->index()][7];
+
+            // residuo_x = sqrt(residuo_x);
+            // residuo_y = sqrt(residuo_y);
+
+            // residuo_x = pow(residuo_x, 2);
+            // residuo_y = pow(residuo_y, 2);
+
+            residuo2_x = componentes2[0] + componentes2[2] - componentes2[4] + componentes2[6];
+            residuo2_y = componentes2[1] + componentes2[3] - componentes2[5] + componentes2[7];
+
+            // Extrai solução do ponto no meio da célula
+            Vector<double> tmp_vector(dim + 1);
+            VectorTools::point_value(dof_handler, solution, p, tmp_vector);
+
+            double residuo_mag = sqrt(pow(residuo_x, 2) + pow(residuo_y, 2));
+            double residuo2_mag = sqrt(pow(residuo2_x, 2) + pow(residuo2_y, 2));
+            double dif_mag = sqrt(pow(values[0] - tmp_vector[0], 2) + pow(values[1] - tmp_vector[1], 2));
+
+            std::cout << "---- celula " << cell->index() << "----" << std::endl;
+            std::cout << "n_q_points: " << n_q_points << std::endl;
+            std::cout << "residuo_x: " << residuo_x << ", residuo_y: " << residuo_y << ", magnitude: " << residuo_mag << std::endl;
+            std::cout << "residuo2_x: " << residuo2_x << ", residuo2_y: " << residuo2_y << ", magnitude2: " << residuo2_mag << std::endl;
+            std::cout << "sol_exata_x: " << values[0] << ", sol_exata_y: " << values[1] << std::endl;
+            std::cout << "sol_x: " << tmp_vector[0] << ", sol_y: " << tmp_vector[1] << std::endl;
+            std::cout << "dif_x: " << std::abs(values[0] - tmp_vector[0]) << ", dif_y: " << std::abs(values[1] - tmp_vector[1]) << ", magnitude: " << dif_mag << std::endl;
+            std::cout << std::endl;
+
+            i++;
+        }
+        exit(5);
+    }
     /*
      * Calcula erro na norma L2 entre duas soluções
      */
@@ -405,6 +718,7 @@ class NavierStokesCG {
                                                    system_matrix, system_rhs);
         }
     }
+
     void solve() {
         SparseDirectUMFPACK A_direct;
         A_direct.initialize(system_matrix);
@@ -508,7 +822,7 @@ int main() {
     const int dim = 2;
 
     for (int i = 2; i < 6; ++i) {
-        NavierStokesCG<dim> problem(1);
+        NavierStokesCG<dim> problem(2);
         problem.run(i, convergence_table);
     }
     convergence_table.set_precision("L2_u", 3);
